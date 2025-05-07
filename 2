@@ -1,0 +1,815 @@
+# Create project structure
+mkdir -p vamosway/{static/{css,js,images},templates/{auth,admin},models,services}
+cd vamosway
+
+# 1. Set up Python environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install requirements
+pip install flask flask-login flask-sqlalchemy openai pillow python-dotenv requests
+
+# 2. Create main application files
+cat > app.py << 'EOL'
+from flask import Flask, render_template, request, jsonify, redirect, url_for
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from models import db, User, Hotel, Activity, Booking
+from services.recommendation_engine import RecommendationEngine
+from services.image_processor import process_and_store_image
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///vamosway.db'
+app.config['UPLOAD_FOLDER'] = 'static/images/uploads'
+app.config['AI_MODEL'] = os.getenv('AI_MODEL', 'gpt-4')
+
+db.init_app(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+
+# Initialize AI recommendation engine
+recommendation_engine = RecommendationEngine()
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        user = User.query.filter_by(email=email).first()
+        if user and check_password_hash(user.password, password):
+            login_user(user)
+            return redirect(url_for('dashboard'))
+    return render_template('auth/login.html')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = generate_password_hash(request.form['password'])
+        new_user = User(email=email, password=password)
+        db.session.add(new_user)
+        db.session.commit()
+        return redirect(url_for('login'))
+    return render_template('auth/register.html')
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('home'))
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    return render_template('dashboard.html', user=current_user)
+
+@app.route('/hotels')
+def hotels():
+    hotels = Hotel.query.all()
+    return render_template('hotels.html', hotels=hotels)
+
+@app.route('/ai-recommendations', methods=['GET', 'POST'])
+@login_required
+def ai_recommendations():
+    if request.method == 'POST':
+        preferences = request.form.get('preferences')
+        budget = request.form.get('budget')
+        duration = request.form.get('duration')
+        
+        recommendations = recommendation_engine.generate(
+            user_id=current_user.id,
+            preferences=preferences,
+            budget=budget,
+            duration=duration
+        )
+        return render_template('recommendations.html', recommendations=recommendations)
+    return render_template('ai_recommendations.html')
+
+@app.route('/upload-image', methods=['POST'])
+@login_required
+def upload_image():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    
+    if file and allowed_file(file.filename):
+        filename = process_and_store_image(file)
+        return jsonify({'success': True, 'filename': filename})
+    return jsonify({'error': 'Invalid file type'}), 400
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in {'png', 'jpg', 'jpeg'}
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
+EOL
+
+# 3. Create database models
+cat > models/__init__.py << 'EOL'
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_login import UserMixin
+
+db = SQLAlchemy()
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(100), unique=True)
+    password = db.Column(db.String(100))
+    bookings = db.relationship('Booking', backref='user', lazy=True)
+
+class Hotel(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100))
+    location = db.Column(db.String(100))
+    price = db.Column(db.Float)
+    rating = db.Column(db.Float)
+    image = db.Column(db.String(100))
+    description = db.Column(db.Text)
+
+class Activity(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100))
+    location = db.Column(db.String(100))
+    price = db.Column(db.Float)
+    duration = db.Column(db.String(50))
+    image = db.Column(db.String(100))
+    description = db.Column(db.Text)
+
+class Booking(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    hotel_id = db.Column(db.Integer, db.ForeignKey('hotel.id'))
+    activity_id = db.Column(db.Integer, db.ForeignKey('activity.id'))
+    date = db.Column(db.String(50))
+    status = db.Column(db.String(20))
+EOL
+
+# 4. Create AI services
+mkdir -p services
+cat > services/recommendation_engine.py << 'EOL'
+import openai
+import os
+from models import Hotel, Activity
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class RecommendationEngine:
+    def __init__(self):
+        openai.api_key = os.getenv('OPENAI_API_KEY')
+        self.model = os.getenv('AI_MODEL', 'gpt-4')
+
+    def generate(self, user_id, preferences, budget, duration):
+        # Get database data
+        hotels = Hotel.query.all()
+        activities = Activity.query.all()
+        
+        # Generate AI recommendations
+        prompt = f"""
+        As a Moroccan travel expert, suggest a personalized itinerary with:
+        - Preferences: {preferences}
+        - Budget: {budget} MAD
+        - Duration: {duration} days
+        Available hotels: {[h.name for h in hotels]}
+        Available activities: {[a.name for a in activities]}
+        Provide detailed daily plans with hotel stays, activities, and estimated costs.
+        """
+        
+        response = openai.ChatCompletion.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful Moroccan travel assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content
+EOL
+
+cat > services/image_processor.py << 'EOL'
+from PIL import Image
+import os
+from datetime import datetime
+from flask import current_app
+
+def process_and_store_image(file):
+    # Create upload folder if not exists
+    if not os.path.exists(current_app.config['UPLOAD_FOLDER']):
+        os.makedirs(current_app.config['UPLOAD_FOLDER'])
+    
+    # Process image
+    img = Image.open(file.stream)
+    img.thumbnail((800, 800))
+    
+    # Generate unique filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ext = file.filename.split('.')[-1]
+    filename = f"{timestamp}.{ext}"
+    save_path = os.path.join(current_app.config['UPLOAD_FOLDER'], filename)
+    
+    # Save image
+    img.save(save_path)
+    return filename
+EOL
+
+# 5. Create templates
+cat > templates/base.html << 'EOL'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VamosWay - {% block title %}{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/moroccan.css') }}">
+</head>
+<body class="bg-gray-100">
+    <nav class="bg-gradient-to-r from-red-800 to-green-800 text-white p-4 shadow-lg">
+        <div class="container mx-auto flex justify-between items-center">
+            <a href="{{ url_for('home') }}" class="text-2xl font-bold">VamosWay</a>
+            <div class="flex space-x-4">
+                {% if current_user.is_authenticated %}
+                    <a href="{{ url_for('dashboard') }}" class="hover:text-yellow-300">
+                        <i class="fas fa-user-circle mr-1"></i> Dashboard
+                    </a>
+                    <a href="{{ url_for('logout') }}" class="hover:text-yellow-300">
+                        <i class="fas fa-sign-out-alt mr-1"></i> Logout
+                    </a>
+                {% else %}
+                    <a href="{{ url_for('login') }}" class="hover:text-yellow-300">
+                        <i class="fas fa-sign-in-alt mr-1"></i> Login
+                    </a>
+                    <a href="{{ url_for('register') }}" class="hover:text-yellow-300">
+                        <i class="fas fa-user-plus mr-1"></i> Register
+                    </a>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+
+    <main class="container mx-auto p-4">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }} p-3 mb-4 rounded">
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="bg-gradient-to-r from-red-800 to-green-800 text-white p-4 mt-8">
+        <div class="container mx-auto text-center">
+            <p>&copy; 2023 VamosWay - Your Moroccan Travel Companion</p>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>
+EOL
+
+cat > templates/index.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Home{% endblock %}
+
+{% block content %}
+<div class="hero bg-cover bg-center h-96 rounded-lg shadow-lg mb-8" 
+     style="background-image: url('{{ url_for('static', filename='images/morocco-hero.jpg') }}')">
+    <div class="bg-black bg-opacity-50 h-full flex items-center justify-center rounded-lg">
+        <div class="text-center text-white p-4">
+            <h1 class="text-4xl font-bold mb-4">Discover Morocco Like Never Before</h1>
+            <p class="text-xl mb-6">AI-powered personalized travel experiences</p>
+            <a href="{{ url_for('ai_recommendations') }}" 
+               class="bg-yellow-500 hover:bg-yellow-600 text-black font-bold py-3 px-6 rounded-lg text-lg transition duration-300">
+                Get Your Custom Itinerary
+            </a>
+        </div>
+    </div>
+</div>
+
+<div class="grid md:grid-cols-3 gap-6 mb-8">
+    <div class="bg-white p-6 rounded-lg shadow-lg hover:shadow-xl transition duration-300">
+        <div class="text-red-700 text-4xl mb-4">
+            <i class="fas fa-hotel"></i>
+        </div>
+        <h3 class="text-xl font-bold mb-2">Luxury Stays</h3>
+        <p>Discover authentic riads and luxury hotels across Morocco's imperial cities.</p>
+        <a href="{{ url_for('hotels') }}" class="text-green-700 hover:underline mt-4 inline-block">Explore Hotels</a>
+    </div>
+    
+    <div class="bg-white p-6 rounded-lg shadow-lg hover:shadow-xl transition duration-300">
+        <div class="text-green-700 text-4xl mb-4">
+            <i class="fas fa-map-marked-alt"></i>
+        </div>
+        <h3 class="text-xl font-bold mb-2">Unique Experiences</h3>
+        <p>From Sahara desert camps to coastal adventures, find your perfect activity.</p>
+        <a href="{{ url_for('ai_recommendations') }}" class="text-red-700 hover:underline mt-4 inline-block">Find Activities</a>
+    </div>
+    
+    <div class="bg-white p-6 rounded-lg shadow-lg hover:shadow-xl transition duration-300">
+        <div class="text-yellow-600 text-4xl mb-4">
+            <i class="fas fa-robot"></i>
+        </div>
+        <h3 class="text-xl font-bold mb-2">AI Recommendations</h3>
+        <p>Get personalized travel plans powered by artificial intelligence.</p>
+        <a href="{{ url_for('ai_recommendations') }}" class="text-blue-700 hover:underline mt-4 inline-block">Try AI Planner</a>
+    </div>
+</div>
+{% endblock %}
+EOL
+
+# Create auth templates
+mkdir -p templates/auth
+cat > templates/auth/login.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Login{% endblock %}
+
+{% block content %}
+<div class="max-w-md mx-auto bg-white p-8 rounded-lg shadow-lg">
+    <h2 class="text-2xl font-bold text-center mb-6 text-green-800">Login to VamosWay</h2>
+    <form method="POST" action="{{ url_for('login') }}">
+        <div class="mb-4">
+            <label for="email" class="block text-gray-700 mb-2">Email</label>
+            <input type="email" id="email" name="email" required
+                   class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-600">
+        </div>
+        <div class="mb-6">
+            <label for="password" class="block text-gray-700 mb-2">Password</label>
+            <input type="password" id="password" name="password" required
+                   class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-600">
+        </div>
+        <button type="submit" 
+                class="w-full bg-green-700 hover:bg-green-800 text-white font-bold py-2 px-4 rounded-md transition duration-300">
+            Login
+        </button>
+    </form>
+    <p class="mt-4 text-center text-gray-600">
+        Don't have an account? <a href="{{ url_for('register') }}" class="text-green-700 hover:underline">Register here</a>
+    </p>
+</div>
+{% endblock %}
+EOL
+
+cat > templates/auth/register.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Register{% endblock %}
+
+{% block content %}
+<div class="max-w-md mx-auto bg-white p-8 rounded-lg shadow-lg">
+    <h2 class="text-2xl font-bold text-center mb-6 text-red-800">Create Your Account</h2>
+    <form method="POST" action="{{ url_for('register') }}">
+        <div class="mb-4">
+            <label for="email" class="block text-gray-700 mb-2">Email</label>
+            <input type="email" id="email" name="email" required
+                   class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600">
+        </div>
+        <div class="mb-6">
+            <label for="password" class="block text-gray-700 mb-2">Password</label>
+            <input type="password" id="password" name="password" required
+                   class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600">
+        </div>
+        <button type="submit" 
+                class="w-full bg-red-700 hover:bg-red-800 text-white font-bold py-2 px-4 rounded-md transition duration-300">
+            Register
+        </button>
+    </form>
+    <p class="mt-4 text-center text-gray-600">
+        Already have an account? <a href="{{ url_for('login') }}" class="text-red-700 hover:underline">Login here</a>
+    </p>
+</div>
+{% endblock %}
+EOL
+
+# Create dashboard template
+cat > templates/dashboard.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="bg-white rounded-lg shadow-lg p-6 mb-8">
+    <h2 class="text-2xl font-bold mb-6 text-green-800">Welcome, {{ user.email }}</h2>
+    
+    <div class="grid md:grid-cols-2 gap-6">
+        <div class="border border-gray-200 rounded-lg p-4">
+            <h3 class="text-xl font-semibold mb-4 text-red-700">
+                <i class="fas fa-calendar-alt mr-2"></i>Upcoming Trips
+            </h3>
+            <div class="bg-gray-100 p-4 rounded-lg">
+                <p class="text-gray-600">You don't have any upcoming trips yet.</p>
+                <a href="{{ url_for('ai_recommendations') }}" 
+                   class="inline-block mt-3 bg-green-700 hover:bg-green-800 text-white px-4 py-2 rounded-md transition duration-300">
+                    Plan a Trip
+                </a>
+            </div>
+        </div>
+        
+        <div class="border border-gray-200 rounded-lg p-4">
+            <h3 class="text-xl font-semibold mb-4 text-red-700">
+                <i class="fas fa-heart mr-2"></i>Saved Items
+            </h3>
+            <div class="bg-gray-100 p-4 rounded-lg">
+                <p class="text-gray-600">Your saved hotels and activities will appear here.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="bg-white rounded-lg shadow-lg p-6">
+    <h3 class="text-xl font-semibold mb-4 text-green-800">
+        <i class="fas fa-lightbulb mr-2"></i>AI Travel Assistant
+    </h3>
+    <div class="bg-gradient-to-r from-red-50 to-green-50 p-6 rounded-lg border border-green-200">
+        <p class="mb-4">Get personalized recommendations for your next Moroccan adventure.</p>
+        <a href="{{ url_for('ai_recommendations') }}" 
+           class="inline-block bg-gradient-to-r from-red-700 to-green-700 hover:from-red-800 hover:to-green-800 text-white px-6 py-3 rounded-lg font-bold transition duration-300">
+            Start AI Planning
+        </a>
+    </div>
+</div>
+{% endblock %}
+EOL
+
+# Create AI recommendations templates
+cat > templates/ai_recommendations.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}AI Recommendations{% endblock %}
+
+{% block content %}
+<div class="bg-white rounded-lg shadow-lg p-6 mb-8">
+    <h2 class="text-2xl font-bold mb-6 text-green-800">AI Travel Planner</h2>
+    
+    <form method="POST" action="{{ url_for('ai_recommendations') }}" class="space-y-6">
+        <div>
+            <label for="preferences" class="block text-gray-700 mb-2 font-medium">Your Travel Preferences</label>
+            <textarea id="preferences" name="preferences" rows="3"
+                      class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-600"
+                      placeholder="E.g., I love cultural experiences, beach relaxation, and trying local food..."></textarea>
+        </div>
+        
+        <div class="grid md:grid-cols-2 gap-6">
+            <div>
+                <label for="budget" class="block text-gray-700 mb-2 font-medium">Budget (MAD)</label>
+                <select id="budget" name="budget" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-600">
+                    <option value="1000-3000">1,000 - 3,000 MAD</option>
+                    <option value="3000-6000">3,000 - 6,000 MAD</option>
+                    <option value="6000+">6,000+ MAD</option>
+                </select>
+            </div>
+            
+            <div>
+                <label for="duration" class="block text-gray-700 mb-2 font-medium">Trip Duration</label>
+                <select id="duration" name="duration" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-600">
+                    <option value="3-5">3-5 days</option>
+                    <option value="5-7">5-7 days</option>
+                    <option value="7+">7+ days</option>
+                </select>
+            </div>
+        </div>
+        
+        <div class="mt-6">
+            <button type="submit" 
+                    class="w-full bg-gradient-to-r from-green-700 to-blue-700 hover:from-green-800 hover:to-blue-800 text-white font-bold py-3 px-4 rounded-md transition duration-300">
+                <i class="fas fa-robot mr-2"></i> Generate AI Recommendations
+            </button>
+        </div>
+    </form>
+</div>
+
+<div class="bg-white rounded-lg shadow-lg p-6">
+    <h3 class="text-xl font-semibold mb-4 text-red-700">How It Works</h3>
+    <div class="grid md:grid-cols-3 gap-6">
+        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
+            <div class="text-green-700 text-2xl mb-3">
+                <i class="fas fa-edit"></i>
+            </div>
+            <h4 class="font-bold mb-2">1. Share Preferences</h4>
+            <p class="text-gray-600">Tell us what kind of experience you're looking for.</p>
+        </div>
+        
+        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
+            <div class="text-red-700 text-2xl mb-3">
+                <i class="fas fa-brain"></i>
+            </div>
+            <h4 class="font-bold mb-2">2. AI Analysis</h4>
+            <p class="text-gray-600">Our system processes thousands of data points.</p>
+        </div>
+        
+        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
+            <div class="text-blue-700 text-2xl mb-3">
+                <i class="fas fa-map-marked-alt"></i>
+            </div>
+            <h4 class="font-bold mb-2">3. Get Your Plan</h4>
+            <p class="text-gray-600">Receive a personalized itinerary in seconds.</p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+EOL
+
+cat > templates/recommendations.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Your Recommendations{% endblock %}
+
+{% block content %}
+<div class="bg-white rounded-lg shadow-lg p-6 mb-8">
+    <div class="flex justify-between items-center mb-6">
+        <h2 class="text-2xl font-bold text-green-800">Your AI-Generated Itinerary</h2>
+        <a href="{{ url_for('ai_recommendations') }}" 
+           class="bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold py-2 px-4 rounded-lg transition duration-300">
+            <i class="fas fa-redo mr-1"></i> Regenerate
+        </a>
+    </div>
+    
+    <div class="bg-gray-50 border border-gray-200 rounded-lg p-6 mb-6">
+        <div class="prose max-w-none">
+            {{ recommendations|safe }}
+        </div>
+    </div>
+    
+    <div class="flex justify-end space-x-4">
+        <button class="bg-red-700 hover:bg-red-800 text-white font-bold py-2 px-4 rounded-lg transition duration-300">
+            <i class="fas fa-bookmark mr-1"></i> Save Itinerary
+        </button>
+        <button class="bg-green-700 hover:bg-green-800 text-white font-bold py-2 px-4 rounded-lg transition duration-300">
+            <i class="fas fa-download mr-1"></i> Download PDF
+        </button>
+    </div>
+</div>
+
+<div class="bg-white rounded-lg shadow-lg p-6">
+    <h3 class="text-xl font-semibold mb-4 text-red-700">Ready to Book?</h3>
+    <p class="mb-4">Found an itinerary you love? Start booking your hotels and activities.</p>
+    <div class="flex space-x-4">
+        <a href="{{ url_for('hotels') }}" 
+           class="bg-yellow-600 hover:bg-yellow-700 text-white font-bold py-2 px-4 rounded-lg transition duration-300">
+            <i class="fas fa-hotel mr-1"></i> Browse Hotels
+        </a>
+        <a href="#" 
+           class="bg-blue-700 hover:bg-blue-800 text-white font-bold py-2 px-4 rounded-lg transition duration-300">
+            <i class="fas fa-tasks mr-1"></i> View Activities
+        </a>
+    </div>
+</div>
+{% endblock %}
+EOL
+
+# Create hotels template
+cat > templates/hotels.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Hotels in Morocco{% endblock %}
+
+{% block content %}
+<div class="bg-white rounded-lg shadow-lg p-6 mb-8">
+    <div class="flex justify-between items-center mb-6">
+        <h2 class="text-2xl font-bold text-green-800">Featured Hotels & Riads</h2>
+        <div class="relative">
+            <select class="block appearance-none bg-gray-200 border border-gray-200 text-gray-700 py-2 px-4 pr-8 rounded-lg leading-tight focus:outline-none focus:bg-white focus:border-gray-500">
+                <option>Sort By</option>
+                <option>Price: Low to High</option>
+                <option>Price: High to Low</option>
+                <option>Rating</option>
+            </select>
+        </div>
+    </div>
+    
+    <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {% for hotel in hotels %}
+        <div class="border border-gray-200 rounded-lg overflow-hidden hover:shadow-lg transition duration-300">
+            <div class="h-48 overflow-hidden">
+                <img src="{{ url_for('static', filename='images/hotels/' + hotel.image) if hotel.image else url_for('static', filename='images/default-hotel.jpg') }}" 
+                     alt="{{ hotel.name }}" class="w-full h-full object-cover">
+            </div>
+            <div class="p-4">
+                <div class="flex justify-between items-start mb-2">
+                    <h3 class="text-lg font-bold text-red-700">{{ hotel.name }}</h3>
+                    <span class="bg-green-100 text-green-800 text-xs font-semibold px-2.5 py-0.5 rounded">
+                        {{ hotel.rating }} <i class="fas fa-star"></i>
+                    </span>
+                </div>
+                <p class="text-gray-600 mb-3">
+                    <i class="fas fa-map-marker-alt text-green-700 mr-1"></i> {{ hotel.location }}
+                </p>
+                <p class="text-gray-700 mb-4">{{ hotel.description|truncate(100) }}</p>
+                <div class="flex justify-between items-center">
+                    <span class="text-lg font-bold">{{ hotel.price }} MAD/night</span>
+                    <button class="bg-green-700 hover:bg-green-800 text-white py-1 px-3 rounded-lg text-sm transition duration-300">
+                        View Details
+                    </button>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}
+EOL
+
+# Create CSS file
+cat > static/css/moroccan.css << 'EOL'
+/* Moroccan-inspired color scheme */
+:root {
+    --morocco-red: #C1272D;
+    --morocco-green: #006233;
+    --morocco-gold: #D4AF37;
+    --morocco-blue: #72A0C1;
+    --morocco-light: #F8F1E5;
+}
+
+/* Custom styles */
+.hero {
+    position: relative;
+    background-size: cover;
+    background-position: center;
+}
+
+.alert {
+    position: relative;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    border: 1px solid transparent;
+    border-radius: 0.25rem;
+}
+
+.alert-success {
+    color: #155724;
+    background-color: #d4edda;
+    border-color: #c3e6cb;
+}
+
+.alert-error {
+    color: #721c24;
+    background-color: #f8d7da;
+    border-color: #f5c6cb;
+}
+
+/* Moroccan pattern overlay */
+.morocco-pattern {
+    background-image: url('/static/images/moroccan-pattern.png');
+    opacity: 0.1;
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 0;
+}
+
+/* Transition effects */
+.fade-enter-active, .fade-leave-active {
+    transition: opacity 0.5s;
+}
+.fade-enter, .fade-leave-to {
+    opacity: 0;
+}
+
+/* Custom button styles */
+.btn-morocco {
+    background: linear-gradient(to right, var(--morocco-red), var(--morocco-green));
+    color: white;
+    transition: all 0.3s ease;
+}
+
+.btn-morocco:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .hero h1 {
+        font-size: 2rem;
+    }
+}
+EOL
+
+# Create JavaScript file
+cat > static/js/main.js << 'EOL'
+document.addEventListener('DOMContentLoaded', function() {
+    // Image upload preview
+    const imageUpload = document.getElementById('image-upload');
+    if (imageUpload) {
+        imageUpload.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(event) {
+                    document.getElementById('image-preview').src = event.target.result;
+                }
+                reader.readAsDataURL(file);
+            }
+        });
+    }
+
+    // Smooth scrolling for anchor links
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener('click', function(e) {
+            e.preventDefault();
+            document.querySelector(this.getAttribute('href')).scrollIntoView({
+                behavior: 'smooth'
+            });
+        });
+    });
+
+    // Form validation
+    const forms = document.querySelectorAll('form');
+    forms.forEach(form => {
+        form.addEventListener('submit', function(e) {
+            let valid = true;
+            const inputs = form.querySelectorAll('input[required], select[required], textarea[required]');
+            
+            inputs.forEach(input => {
+                if (!input.value.trim()) {
+                    input.classList.add('border-red-500');
+                    valid = false;
+                } else {
+                    input.classList.remove('border-red-500');
+                }
+            });
+            
+            if (!valid) {
+                e.preventDefault();
+                alert('Please fill in all required fields');
+            }
+        });
+    });
+
+    // Initialize tooltips
+    const tooltipElements = document.querySelectorAll('[data-tooltip]');
+    tooltipElements.forEach(el => {
+        el.addEventListener('mouseenter', showTooltip);
+        el.addEventListener('mouseleave', hideTooltip);
+    });
+
+    function showTooltip(e) {
+        const tooltipText = this.getAttribute('data-tooltip');
+        const tooltip = document.createElement('div');
+        tooltip.className = 'absolute z-50 bg-black text-white text-xs rounded py-1 px-2';
+        tooltip.textContent = tooltipText;
+        this.appendChild(tooltip);
+        
+        positionTooltip(this, tooltip);
+    }
+
+    function hideTooltip() {
+        const tooltip = this.querySelector('div');
+        if (tooltip) {
+            this.removeChild(tooltip);
+        }
+    }
+
+    function positionTooltip(parent, tooltip) {
+        // Positioning logic here
+    }
+});
+EOL
+
+# Create environment file
+cat > .env << 'EOL'
+SECRET_KEY=your-secret-key-here
+OPENAI_API_KEY=your-openai-api-key-here
+AI_MODEL=gpt-4
+UPLOAD_FOLDER=static/images/uploads
+EOL
+
+# Create sample images directory
+mkdir -p static/images/{hotels,uploads}
+touch static/images/morocco-hero.jpg
+touch static/images/default-hotel.jpg
+touch static/images/moroccan-pattern.png
+
+# Initialize database and run
+python3 -c "from app import app, db; with app.app_context(): db.create_all()"
+python3 app.py
