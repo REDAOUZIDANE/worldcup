@@ -1,0 +1,1081 @@
+# 1. Create project structure with modern best practices
+mkdir -p vamosway/{app/{core,modules/{auth,hotels,bookings,admin},lib,static/{dist,media}},config,infra/{docker,kubernetes},scripts,terraform,docs}
+cd vamosway
+
+# 2. Set up Python environment with pinned dependencies
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 3. Create professional requirements files
+cat > requirements/base.txt << 'EOL'
+# Core
+Flask==2.3.2
+Werkzeug==2.3.7
+Jinja2==3.1.2
+itsdangerous==2.1.2
+
+# Database
+SQLAlchemy==2.0.19
+Flask-SQLAlchemy==3.0.3
+Flask-Migrate==4.0.4
+psycopg2-binary==2.9.6
+redis==4.5.5
+
+# Security
+Flask-Login==0.6.2
+Flask-Talisman==1.0.0
+Flask-Limiter==2.8.1
+bcrypt==4.0.1
+PyJWT==2.7.0
+cryptography==41.0.2
+
+# API
+Flask-RESTful==0.3.9
+Flask-Cors==3.0.10
+marshmallow==3.19.0
+apispec==6.3.0
+
+# Cloud
+boto3==1.28.42
+google-cloud-storage==2.9.0
+azure-storage-blob==12.16.0
+
+# Async
+celery==5.3.1
+eventlet==0.33.3
+
+# Monitoring
+sentry-sdk[flask]==1.30.0
+prometheus-flask-exporter==0.21.0
+blinker==1.6.2
+
+# Email
+Flask-Mailman==1.0.0
+
+# Utilities
+python-dotenv==1.0.0
+Pillow==10.0.0
+python-magic==0.4.27
+python-dateutil==2.8.2
+EOL
+
+cat > requirements/production.txt << 'EOL'
+-r base.txt
+gunicorn==20.1.0
+greenlet==2.0.2
+gevent==22.10.2
+EOL
+
+cat > requirements/development.txt << 'EOL'
+-r base.txt
+Flask-DebugToolbar==0.13.1
+pytest==7.4.0
+pytest-cov==4.1.0
+black==23.7.0
+flake8==6.0.0
+mypy==1.4.1
+EOL
+
+pip install -r requirements/production.txt
+
+# 4. Create professional application factory
+cat > app/__init__.py << 'EOL'
+import logging
+from logging.handlers import RotatingFileHandler
+from flask import Flask
+from flask_talisman import Talisman
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import sentry_sdk
+from sentry_sdk.integrations.flask import FlaskIntegration
+from prometheus_flask_exporter import PrometheusMetrics
+from config import config
+import os
+
+# Initialize extensions
+limiter = Limiter(key_func=get_remote_address)
+metrics = PrometheusMetrics.for_app_factory()
+csp = {
+    'default-src': "'self'",
+    'script-src': [
+        "'self'",
+        "'unsafe-inline'",
+        "'unsafe-eval'",
+        "cdn.jsdelivr.net",
+        "cdnjs.cloudflare.com"
+    ],
+    'style-src': [
+        "'self'",
+        "'unsafe-inline'",
+        "fonts.googleapis.com",
+        "cdn.jsdelivr.net"
+    ],
+    'font-src': [
+        "'self'",
+        "fonts.gstatic.com",
+        "cdn.jsdelivr.net"
+    ],
+    'img-src': [
+        "'self'",
+        "data:",
+        "blob:",
+        "*.amazonaws.com",
+        "storage.googleapis.com",
+        "*.blob.core.windows.net"
+    ],
+    'connect-src': [
+        "'self'",
+        "*.sentry.io"
+    ]
+}
+
+def create_app(config_name='default'):
+    """Application factory pattern"""
+    
+    # Initialize Flask app
+    app = Flask(__name__)
+    app.config.from_object(config[config_name])
+    config[config_name].init_app(app)
+    
+    # Initialize Sentry
+    if app.config.get('SENTRY_DSN'):
+        sentry_sdk.init(
+            dsn=app.config['SENTRY_DSN'],
+            integrations=[FlaskIntegration()],
+            traces_sample_rate=app.config.get('SENTRY_TRACES_SAMPLE_RATE', 1.0),
+            profiles_sample_rate=app.config.get('SENTRY_PROFILES_SAMPLE_RATE', 1.0),
+            environment=app.config.get('ENVIRONMENT', 'production')
+        )
+    
+    # Configure logging
+    if not app.debug and not app.testing:
+        if not os.path.exists('logs'):
+            os.mkdir('logs')
+        file_handler = RotatingFileHandler(
+            'logs/vamosway.log',
+            maxBytes=10240,
+            backupCount=10
+        )
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s: %(message)s '
+            '[in %(pathname)s:%(lineno)d]'
+        ))
+        file_handler.setLevel(logging.INFO)
+        app.logger.addHandler(file_handler)
+        app.logger.setLevel(logging.INFO)
+        app.logger.info('VamosWay startup')
+    
+    # Security middleware
+    Talisman(
+        app,
+        force_https=app.config['FORCE_HTTPS'],
+        strict_transport_security=True,
+        session_cookie_secure=True,
+        content_security_policy=csp,
+        content_security_policy_nonce_in=['script-src']
+    )
+    
+    # CORS configuration
+    CORS(
+        app,
+        resources={
+            r"/api/*": {
+                "origins": app.config['CORS_ORIGINS'],
+                "methods": ["GET", "POST", "PUT", "DELETE"],
+                "allow_headers": ["Content-Type", "Authorization"]
+            }
+        },
+        supports_credentials=True
+    )
+    
+    # Rate limiting
+    limiter.init_app(app)
+    
+    # Prometheus metrics
+    if app.config['PROMETHEUS_ENABLED']:
+        metrics.init_app(app)
+    
+    # Register blueprints
+    register_blueprints(app)
+    
+    # Register error handlers
+    register_error_handlers(app)
+    
+    # Register CLI commands
+    register_commands(app)
+    
+    # Register context processors
+    register_context_processors(app)
+    
+    return app
+
+def register_blueprints(app):
+    """Register Flask blueprints"""
+    from app.modules.auth.routes import auth_bp
+    from app.modules.hotels.routes import hotels_bp
+    from app.modules.bookings.routes import bookings_bp
+    from app.modules.admin.routes import admin_bp
+    
+    app.register_blueprint(auth_bp, url_prefix='/auth')
+    app.register_blueprint(hotels_bp, url_prefix='/api/v1/hotels')
+    app.register_blueprint(bookings_bp, url_prefix='/api/v1/bookings')
+    app.register_blueprint(admin_bp, url_prefix='/admin')
+
+def register_error_handlers(app):
+    """Register error handlers"""
+    from app.core.exceptions import (
+        InvalidAPIUsage,
+        handle_invalid_api_usage,
+        handle_404_not_found,
+        handle_500_internal_error
+    )
+    
+    app.register_error_handler(InvalidAPIUsage, handle_invalid_api_usage)
+    app.register_error_handler(404, handle_404_not_found)
+    app.register_error_handler(500, handle_500_internal_error)
+
+def register_commands(app):
+    """Register CLI commands"""
+    from app.core.commands import (
+        init_db_command,
+        create_admin_command,
+        seed_data_command
+    )
+    
+    app.cli.add_command(init_db_command)
+    app.cli.add_command(create_admin_command)
+    app.cli.add_command(seed_data_command)
+
+def register_context_processors(app):
+    """Register template context processors"""
+    @app.context_processor
+    def inject_globals():
+        return {
+            'app_version': app.config['APP_VERSION'],
+            'current_year': datetime.now().year
+        }
+EOL
+
+# 5. Create professional configuration
+mkdir -p config
+cat > config/__init__.py << 'EOL'
+import os
+from dotenv import load_dotenv
+from logging.config import dictConfig
+
+load_dotenv()
+
+class Config:
+    """Base configuration"""
+    
+    # Core
+    SECRET_KEY = os.getenv('SECRET_KEY')
+    APP_VERSION = os.getenv('APP_VERSION', '1.0.0')
+    ENVIRONMENT = os.getenv('ENVIRONMENT', 'production')
+    
+    # Database
+    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL')
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        'pool_size': int(os.getenv('DB_POOL_SIZE', 10)),
+        'max_overflow': int(os.getenv('DB_MAX_OVERFLOW', 5)),
+        'pool_recycle': int(os.getenv('DB_POOL_RECYCLE', 300)),
+        'pool_pre_ping': True,
+        'pool_use_lifo': True
+    }
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    
+    # Redis
+    REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+    
+    # Security
+    JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY')
+    JWT_ACCESS_TOKEN_EXPIRES = int(os.getenv('JWT_ACCESS_EXPIRES', 3600))
+    JWT_REFRESH_TOKEN_EXPIRES = int(os.getenv('JWT_REFRESH_EXPIRES', 86400))
+    RATE_LIMIT = os.getenv('RATE_LIMIT', '200 per day, 50 per hour')
+    CORS_ORIGINS = os.getenv('CORS_ORIGINS', '').split(',')
+    FORCE_HTTPS = os.getenv('FORCE_HTTPS', 'True') == 'True'
+    
+    # Cloud Storage
+    STORAGE_PROVIDER = os.getenv('STORAGE_PROVIDER', 'local')
+    AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY')
+    AWS_SECRET_KEY = os.getenv('AWS_SECRET_KEY')
+    S3_BUCKET = os.getenv('S3_BUCKET')
+    GCS_BUCKET = os.getenv('GCS_BUCKET')
+    AZURE_CONTAINER = os.getenv('AZURE_CONTAINER')
+    
+    # Email
+    MAIL_SERVER = os.getenv('MAIL_SERVER')
+    MAIL_PORT = int(os.getenv('MAIL_PORT', 587))
+    MAIL_USE_TLS = os.getenv('MAIL_USE_TLS', 'True') == 'True'
+    MAIL_USERNAME = os.getenv('MAIL_USERNAME')
+    MAIL_PASSWORD = os.getenv('MAIL_PASSWORD')
+    MAIL_DEFAULT_SENDER = os.getenv('MAIL_DEFAULT_SENDER')
+    
+    # Monitoring
+    SENTRY_DSN = os.getenv('SENTRY_DSN')
+    SENTRY_TRACES_SAMPLE_RATE = float(os.getenv('SENTRY_TRACES_SAMPLE_RATE', 1.0))
+    PROMETHEUS_ENABLED = os.getenv('PROMETHEUS_ENABLED', 'False') == 'True'
+    
+    # Logging
+    LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+    
+    @staticmethod
+    def init_app(app):
+        """Initialize configuration"""
+        # Configure logging
+        dictConfig({
+            'version': 1,
+            'formatters': {
+                'default': {
+                    'format': '[%(asctime)s] %(levelname)s in %(module)s: %(message)s',
+                }
+            },
+            'handlers': {
+                'console': {
+                    'class': 'logging.StreamHandler',
+                    'formatter': 'default',
+                    'stream': 'ext://sys.stdout'
+                },
+                'file': {
+                    'class': 'logging.handlers.RotatingFileHandler',
+                    'formatter': 'default',
+                    'filename': 'logs/vamosway.log',
+                    'maxBytes': 1024000,
+                    'backupCount': 10
+                }
+            },
+            'root': {
+                'level': Config.LOG_LEVEL,
+                'handlers': ['console', 'file']
+            }
+        })
+
+class ProductionConfig(Config):
+    """Production configuration"""
+    
+    DEBUG = False
+    TESTING = False
+    PROPAGATE_EXCEPTIONS = True
+
+class StagingConfig(Config):
+    """Staging configuration"""
+    
+    DEBUG = False
+    TESTING = False
+    DEVELOPMENT = True
+
+class DevelopmentConfig(Config):
+    """Development configuration"""
+    
+    DEBUG = True
+    TESTING = False
+    DEVELOPMENT = True
+    SQLALCHEMY_ECHO = True
+
+class TestingConfig(Config):
+    """Testing configuration"""
+    
+    DEBUG = False
+    TESTING = True
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'
+
+config = {
+    'production': ProductionConfig,
+    'staging': StagingConfig,
+    'development': DevelopmentConfig,
+    'testing': TestingConfig,
+    'default': ProductionConfig
+}
+EOL
+
+# 6. Create professional database models
+cat > app/core/models.py << 'EOL'
+from datetime import datetime, timedelta
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_login import UserMixin
+from app import db
+import jwt
+from config import Config
+from sqlalchemy import event
+from sqlalchemy.orm import validates
+import re
+
+class BaseModel(db.Model):
+    """Base model with common columns"""
+    
+    __abstract__ = True
+    
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_active = db.Column(db.Boolean, default=True)
+
+class User(UserMixin, BaseModel):
+    """User model"""
+    
+    __tablename__ = 'users'
+    
+    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    email_verified = db.Column(db.Boolean, default=False)
+    is_admin = db.Column(db.Boolean, default=False)
+    last_login = db.Column(db.DateTime)
+    login_attempts = db.Column(db.Integer, default=0)
+    locked_until = db.Column(db.DateTime)
+    
+    # Relationships
+    profile = db.relationship('UserProfile', back_populates='user', uselist=False, cascade='all, delete-orphan')
+    tokens = db.relationship('AuthToken', back_populates='user', cascade='all, delete-orphan')
+    logs = db.relationship('UserLog', back_populates='user', cascade='all, delete-orphan')
+    
+    @property
+    def password(self):
+        raise AttributeError('password is not a readable attribute')
+    
+    @password.setter
+    def password(self, password):
+        self.password_hash = generate_password_hash(password)
+    
+    def verify_password(self, password):
+        return check_password_hash(self.password_hash, password)
+    
+    def get_reset_token(self, expires_in=3600):
+        return jwt.encode(
+            {'user_id': self.id, 'exp': datetime.utcnow() + timedelta(seconds=expires_in)},
+            Config.JWT_SECRET_KEY,
+            algorithm='HS256'
+        )
+    
+    @staticmethod
+    def verify_reset_token(token):
+        try:
+            user_id = jwt.decode(token, Config.JWT_SECRET_KEY, algorithms=['HS256'])['user_id']
+            return User.query.get(user_id)
+        except:
+            return None
+    
+    @validates('email')
+    def validate_email(self, key, email):
+        if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+            raise ValueError('Invalid email address')
+        return email.lower()
+
+class UserProfile(BaseModel):
+    """User profile model"""
+    
+    __tablename__ = 'user_profiles'
+    
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), unique=True)
+    first_name = db.Column(db.String(50))
+    last_name = db.Column(db.String(50))
+    phone = db.Column(db.String(20))
+    avatar = db.Column(db.String(255))
+    
+    user = db.relationship('User', back_populates='profile')
+
+class AuthToken(BaseModel):
+    """Authentication token model"""
+    
+    __tablename__ = 'auth_tokens'
+    
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    token = db.Column(db.String(500), unique=True, index=True)
+    device_info = db.Column(db.String(255))
+    ip_address = db.Column(db.String(45))
+    expires_at = db.Column(db.DateTime)
+    
+    user = db.relationship('User', back_populates='tokens')
+
+class UserLog(BaseModel):
+    """User activity log model"""
+    
+    __tablename__ = 'user_logs'
+    
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    action = db.Column(db.String(50))
+    ip_address = db.Column(db.String(45))
+    user_agent = db.Column(db.Text)
+    metadata = db.Column(db.JSON)
+    
+    user = db.relationship('User', back_populates='logs')
+
+# Add other models (Hotel, RoomType, Booking, etc.) here...
+
+# Event listeners
+@event.listens_for(User, 'before_insert')
+def set_initial_values(mapper, connection, target):
+    """Set initial values before user insert"""
+    if target.email:
+        target.email = target.email.lower()
+
+@event.listens_for(User, 'before_update')
+def update_email_lowercase(mapper, connection, target):
+    """Ensure email is lowercase before update"""
+    if target.email:
+        target.email = target.email.lower()
+EOL
+
+# 7. Create professional authentication service
+cat > app/modules/auth/service.py << 'EOL'
+import time
+from datetime import datetime, timedelta
+import jwt
+from flask import current_app, request
+from werkzeug.security import check_password_hash
+from app.core.models import User, AuthToken, UserLog
+from app.core.exceptions import AuthError, RateLimitError
+from app.lib.security import (
+    validate_password_strength,
+    sanitize_input,
+    is_compromised_password,
+    generate_csrf_token
+)
+from app.lib.geoip import get_location_from_ip
+from app import db
+
+class AuthService:
+    """Authentication and authorization service"""
+    
+    @staticmethod
+    def login_user(email, password, remember=False, ip_address=None, user_agent=None):
+        """Authenticate user and return JWT token"""
+        
+        # Sanitize inputs
+        email = sanitize_input(email).lower()
+        password = sanitize_input(password)
+        
+        # Check rate limits
+        if current_app.limiter.limit(f"login_attempt:{ip_address or request.remote_addr}"):
+            raise RateLimitError('Too many login attempts. Please try again later.')
+        
+        # Find user
+        user = User.query.filter_by(email=email).first()
+        
+        # Security checks
+        if not user or not user.is_active:
+            raise AuthError('Invalid credentials', code=401)
+            
+        if user.locked_until and user.locked_until > datetime.utcnow():
+            remaining = (user.locked_until - datetime.utcnow()).seconds // 60
+            raise AuthError(f'Account temporarily locked. Try again in {remaining} minutes.', code=403)
+        
+        # Verify password
+        if not user.verify_password(password):
+            user.login_attempts += 1
+            
+            # Lock account after 5 failed attempts
+            if user.login_attempts >= 5:
+                user.locked_until = datetime.utcnow() + timedelta(minutes=30)
+                db.session.commit()
+                raise AuthError('Account locked due to too many failed attempts.', code=403)
+            
+            db.session.commit()
+            raise AuthError('Invalid credentials', code=401)
+        
+        # Reset login attempts on success
+        user.login_attempts = 0
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+        
+        # Generate tokens
+        access_token = AuthService.generate_access_token(user, remember)
+        refresh_token = AuthService.generate_refresh_token(user)
+        
+        # Log login
+        AuthService.log_user_action(
+            user.id,
+            'login',
+            ip_address=ip_address or request.remote_addr,
+            user_agent=user_agent or request.user_agent.string
+        )
+        
+        return {
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'token_type': 'Bearer',
+            'expires_in': current_app.config['JWT_ACCESS_TOKEN_EXPIRES']
+        }
+
+    @staticmethod
+    def generate_access_token(user, remember=False):
+        """Generate JWT access token"""
+        expires_in = timedelta(days=7) if remember else timedelta(hours=1)
+        token_payload = {
+            'user_id': user.id,
+            'exp': datetime.utcnow() + expires_in,
+            'iat': datetime.utcnow(),
+            'type': 'access',
+            'csrf': generate_csrf_token()
+        }
+        return jwt.encode(
+            token_payload,
+            current_app.config['JWT_SECRET_KEY'],
+            algorithm='HS256'
+        )
+
+    @staticmethod
+    def generate_refresh_token(user):
+        """Generate JWT refresh token"""
+        expires_in = timedelta(days=30)
+        token_payload = {
+            'user_id': user.id,
+            'exp': datetime.utcnow() + expires_in,
+            'iat': datetime.utcnow(),
+            'type': 'refresh'
+        }
+        token = jwt.encode(
+            token_payload,
+            current_app.config['JWT_SECRET_KEY'],
+            algorithm='HS256'
+        )
+        
+        # Store refresh token in database
+        auth_token = AuthToken(
+            user_id=user.id,
+            token=token,
+            device_info=request.user_agent.string[:255] if request.user_agent else 'Unknown',
+            ip_address=request.remote_addr,
+            expires_at=token_payload['exp']
+        )
+        db.session.add(auth_token)
+        db.session.commit()
+        
+        return token
+
+    @staticmethod
+    def refresh_access_token(refresh_token):
+        """Generate new access token using refresh token"""
+        try:
+            payload = jwt.decode(
+                refresh_token,
+                current_app.config['JWT_SECRET_KEY'],
+                algorithms=['HS256']
+            )
+            
+            # Verify token type
+            if payload.get('type') != 'refresh':
+                raise AuthError('Invalid token type', code=401)
+                
+            # Check if token exists in database
+            auth_token = AuthToken.query.filter_by(
+                token=refresh_token,
+                user_id=payload['user_id']
+            ).first()
+            
+            if not auth_token or auth_token.expires_at < datetime.utcnow():
+                raise AuthError('Invalid or expired refresh token', code=401)
+            
+            # Generate new access token
+            user = User.query.get(payload['user_id'])
+            if not user or not user.is_active:
+                raise AuthError('User not found or inactive', code=401)
+                
+            return AuthService.generate_access_token(user)
+            
+        except jwt.ExpiredSignatureError:
+            raise AuthError('Refresh token has expired', code=401)
+        except jwt.InvalidTokenError:
+            raise AuthError('Invalid refresh token', code=401)
+
+    @staticmethod
+    def register_user(email, password, first_name, last_name, ip_address=None):
+        """Register new user"""
+        
+        # Validate inputs
+        email = sanitize_input(email).lower()
+        password = sanitize_input(password)
+        first_name = sanitize_input(first_name)
+        last_name = sanitize_input(last_name)
+        
+        if is_compromised_password(password):
+            raise AuthError('Password has been compromised in previous breaches', code=400)
+            
+        if not validate_password_strength(password):
+            raise AuthError(
+                'Password must be at least 12 characters with uppercase, lowercase, numbers, and special characters',
+                code=400
+            )
+        
+        # Check if user exists
+        if User.query.filter_by(email=email).first():
+            raise AuthError('Email already registered', code=400)
+        
+        # Create user
+        user = User(
+            email=email,
+            email_verified=False,
+            is_active=True
+        )
+        user.password = password
+        
+        # Create profile
+        profile = UserProfile(
+            first_name=first_name,
+            last_name=last_name,
+            user=user
+        )
+        
+        db.session.add(user)
+        db.session.add(profile)
+        db.session.commit()
+        
+        # Log registration
+        AuthService.log_user_action(
+            user.id,
+            'register',
+            ip_address=ip_address or request.remote_addr,
+            user_agent=request.user_agent.string
+        )
+        
+        return user
+
+    @staticmethod
+    def log_user_action(user_id, action, **kwargs):
+        """Log user activity"""
+        log = UserLog(
+            user_id=user_id,
+            action=action,
+            ip_address=kwargs.get('ip_address'),
+            user_agent=kwargs.get('user_agent'),
+            metadata=kwargs.get('metadata', {})
+        )
+        db.session.add(log)
+        db.session.commit()
+EOL
+
+# 8. Create professional API routes
+cat > app/modules/auth/routes.py << 'EOL'
+from flask import Blueprint, request, jsonify
+from flask_limiter import util
+from app.modules.auth.service import AuthService
+from app.core.exceptions import AuthError
+from app.lib.decorators import validate_json, rate_limit_by_user
+from app.schemas import LoginSchema, RegisterSchema
+
+auth_bp = Blueprint('auth', __name__)
+
+@auth_bp.route('/login', methods=['POST'])
+@validate_json(LoginSchema)
+@rate_limit_by_user('5 per minute')
+def login():
+    """Authenticate user and return JWT tokens"""
+    data = request.get_json()
+    
+    try:
+        tokens = AuthService.login_user(
+            email=data['email'],
+            password=data['password'],
+            remember=data.get('remember', False),
+            ip_address=util.get_remote_address(),
+            user_agent=request.user_agent.string
+        )
+        return jsonify(tokens), 200
+    except AuthError as e:
+        return jsonify({'error': e.message}), e.code
+
+@auth_bp.route('/register', methods=['POST'])
+@validate_json(RegisterSchema)
+@rate_limit_by_user('3 per hour')
+def register():
+    """Register new user"""
+    data = request.get_json()
+    
+    try:
+        user = AuthService.register_user(
+            email=data['email'],
+            password=data['password'],
+            first_name=data['first_name'],
+            last_name=data['last_name'],
+            ip_address=util.get_remote_address()
+        )
+        return jsonify({
+            'message': 'Registration successful',
+            'user_id': user.id
+        }), 201
+    except AuthError as e:
+        return jsonify({'error': e.message}), e.code
+
+@auth_bp.route('/refresh', methods=['POST'])
+@rate_limit_by_user('10 per hour')
+def refresh():
+    """Refresh access token using refresh token"""
+    refresh_token = request.json.get('refresh_token')
+    
+    if not refresh_token:
+        return jsonify({'error': 'Refresh token is required'}), 400
+    
+    try:
+        access_token = AuthService.refresh_access_token(refresh_token)
+        return jsonify({
+            'access_token': access_token,
+            'token_type': 'Bearer'
+        }), 200
+    except AuthError as e:
+        return jsonify({'error': e.message}), e.code
+EOL
+
+# 9. Create professional deployment files
+mkdir -p infra/docker
+cat > infra/docker/Dockerfile << 'EOL'
+# Build stage
+FROM python:3.9-slim as builder
+
+WORKDIR /app
+COPY requirements/production.txt .
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc python3-dev libpq-dev && \
+    pip install --user -r production.txt
+
+# Runtime stage
+FROM python:3.9-slim
+
+WORKDIR /app
+COPY --from=builder /root/.local /root/.local
+COPY . .
+
+ENV PATH=/root/.local/bin:$PATH
+ENV FLASK_APP=app
+ENV FLASK_ENV=production
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libmagic1 libpq5 && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /app/logs && \
+    chmod -R 755 /app/logs
+
+EXPOSE 5000
+
+USER nobody
+
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "--threads", "2", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-", "app:create_app()"]
+EOL
+
+cat > infra/docker/docker-compose.yml << 'EOL'
+version: '3.8'
+
+services:
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=production
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  db:
+    image: postgres:13-alpine
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:6-alpine
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  celery:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    command: celery -A app.celery worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=production
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+EOL
+
+# 10. Create Kubernetes deployment
+mkdir -p infra/kubernetes
+cat > infra/kubernetes/deployment.yaml << 'EOL'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vamosway-web
+  labels:
+    app: vamosway
+    tier: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: vamosway
+      tier: web
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: vamosway
+        tier: web
+    spec:
+      containers:
+      - name: web
+        image: your-registry/vamosway:latest
+        ports:
+        - containerPort: 5000
+        envFrom:
+        - secretRef:
+            name: vamosway-secrets
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 30
+          periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vamosway-web
+spec:
+  selector:
+    app: vamosway
+    tier: web
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 5000
+  type: LoadBalancer
+EOL
+
+# 11. Create Terraform files for cloud deployment
+mkdir -p terraform
+cat > terraform/main.tf << 'EOL'
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 4.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region
+}
+
+module "vamosway_cluster" {
+  source = "./modules/cluster"
+  
+  cluster_name = "vamosway"
+  environment  = var.environment
+  vpc_cidr     = "10.0.0.0/16"
+  region       = var.region
+}
+
+module "vamosway_db" {
+  source = "./modules/database"
+  
+  cluster_name     = "vamosway"
+  environment      = var.environment
+  db_name          = "vamosway"
+  db_username      = var.db_username
+  db_password      = var.db_password
+  vpc_id           = module.vamosway_cluster.vpc_id
+  private_subnets  = module.vamosway_cluster.private_subnets
+  security_group_ids = [module.vamosway_cluster.db_security_group_id]
+}
+
+module "vamosway_cache" {
+  source = "./modules/cache"
+  
+  cluster_name    = "vamosway"
+  environment     = var.environment
+  node_type       = "cache.t3.micro"
+  vpc_id          = module.vamosway_cluster.vpc_id
+  private_subnets = module.vamosway_cluster.private_subnets
+  security_group_ids = [module.vamosway_cluster.redis_security_group_id]
+}
+EOL
+
+# 12. Create professional README and documentation
+cat > README.md << 'EOL'
+# VamosWay - Professional Travel Platform
+
+![VamosWay Logo](app/static/dist/images/logo.png)
+
+## Overview
+
+VamosWay is a professional-grade travel platform built with:
+
+- **Backend**: Python Flask with SQLAlchemy ORM
+- **Frontend**: Modern JavaScript framework (React/Vue)
+- **Database**: PostgreSQL with Redis caching
+- **Infrastructure**: Docker, Kubernetes, and Terraform
+- **CI/CD**: GitHub Actions with automated testing
+
+## Features
+
+- **User Authentication**: JWT-based with refresh tokens
+- **Hotel Management**: CRUD operations with AI recommendations
+- **Booking System**: Real-time availability and reservations
+- **Admin Dashboard**: Comprehensive management interface
+- **API**: RESTful design with OpenAPI documentation
+
+## Getting Started
+
+### Development
+
+1. Clone the repository
+2. Set up Python virtual environment
+3. Install dependencies:
+   ```bash
+   pip install -r requirements/development.txt
