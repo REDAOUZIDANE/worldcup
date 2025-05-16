@@ -1,0 +1,2359 @@
+
+# Update the project structure
+mkdir -p vamosway/static/{css,js,images,fonts} vamosway/templates/{auth,admin,partials} vamosway/utils
+
+# 1. Update requirements
+cat > requirements.txt << 'EOL'
+flask==3.0.0
+flask-login==0.6.3
+flask-sqlalchemy==3.1.1
+flask-oauthlib==0.9.6
+authlib==1.2.1
+openai==1.3.6
+pillow==10.0.1
+python-dotenv==1.0.0
+requests==2.31.0
+googlemaps==4.10.0
+stripe==7.0.0
+geopy==2.4.0
+email-validator==2.0.0
+flask-wtf==1.2.1
+EOL
+
+# Install updated requirements
+pip install -r requirements.txt
+
+# 2. Update app.py with new features
+cat > app.py << 'EOL'
+import os
+from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, session
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from models import db, User, Hotel, Activity, Booking, Review
+from services.recommendation_engine import RecommendationEngine
+from services.image_processor import process_and_store_image
+from services.booking_service import BookingService
+from services.payment_processor import PaymentProcessor
+from utils.social_login import init_social_login
+from utils.email_service import send_confirmation_email
+from utils.map_service import MapService
+from dotenv import load_dotenv
+import stripe
+from datetime import datetime
+from authlib.integrations.flask_client import OAuth
+from flask_wtf.csrf import CSRFProtect
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.getenv('SECRET_KEY'),
+    SQLALCHEMY_DATABASE_URI='sqlite:///vamosway.db',
+    UPLOAD_FOLDER='static/images/uploads',
+    AI_MODEL=os.getenv('AI_MODEL', 'gpt-4'),
+    GOOGLE_MAPS_API_KEY=os.getenv('GOOGLE_MAPS_API_KEY'),
+    STRIPE_PUBLIC_KEY=os.getenv('STRIPE_PUBLIC_KEY'),
+    STRIPE_SECRET_KEY=os.getenv('STRIPE_SECRET_KEY'),
+    OAUTH2_PROVIDERS={
+        'google': {
+            'client_id': os.getenv('GOOGLE_CLIENT_ID'),
+            'client_secret': os.getenv('GOOGLE_CLIENT_SECRET'),
+            'authorize_url': 'https://accounts.google.com/o/oauth2/auth',
+            'token_url': 'https://accounts.google.com/o/oauth2/token',
+            'userinfo': {
+                'url': 'https://www.googleapis.com/oauth2/v3/userinfo',
+                'email': lambda json: json['email'],
+            },
+            'scopes': ['https://www.googleapis.com/auth/userinfo.email'],
+        },
+        'apple': {
+            'client_id': os.getenv('APPLE_CLIENT_ID'),
+            'team_id': os.getenv('APPLE_TEAM_ID'),
+            'key_id': os.getenv('APPLE_KEY_ID'),
+            'private_key': os.getenv('APPLE_PRIVATE_KEY'),
+            'authorize_url': 'https://appleid.apple.com/auth/authorize',
+            'token_url': 'https://appleid.apple.com/auth/token',
+            'scopes': ['name', 'email'],
+        },
+        'twitter': {
+            'client_id': os.getenv('TWITTER_CLIENT_ID'),
+            'client_secret': os.getenv('TWITTER_CLIENT_SECRET'),
+            'authorize_url': 'https://twitter.com/i/oauth2/authorize',
+            'token_url': 'https://twitter.com/i/oauth2/token',
+            'userinfo': {
+                'url': 'https://api.twitter.com/2/users/me',
+                'email': lambda json: json.get('email', ''),
+                'username': lambda json: json.get('username', ''),
+            },
+            'scopes': ['tweet.read', 'users.read'],
+        }
+    }
+)
+
+# Initialize extensions
+db.init_app(app)
+csrf = CSRFProtect(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+stripe.api_key = app.config['STRIPE_SECRET_KEY']
+oauth = OAuth(app)
+
+# Initialize services
+recommendation_engine = RecommendationEngine()
+booking_service = BookingService()
+payment_processor = PaymentProcessor()
+map_service = MapService(app.config['GOOGLE_MAPS_API_KEY'])
+
+# Initialize social login
+init_social_login(app, oauth)
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+@app.route('/')
+def home():
+    featured_hotels = Hotel.query.order_by(Hotel.rating.desc()).limit(3).all()
+    popular_activities = Activity.query.order_by(Activity.price).limit(6).all()
+    return render_template('index.html', 
+                         featured_hotels=featured_hotels,
+                         popular_activities=popular_activities)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+        
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        remember = True if request.form.get('remember') else False
+        
+        user = User.query.filter_by(email=email).first()
+        
+        if not user or not check_password_hash(user.password, password):
+            flash('Invalid email or password', 'error')
+            return redirect(url_for('login'))
+            
+        login_user(user, remember=remember)
+        next_page = request.args.get('next')
+        return redirect(next_page or url_for('dashboard'))
+        
+    return render_template('auth/login.html')
+
+@app.route('/login/<provider>')
+def login_provider(provider):
+    if provider not in app.config['OAUTH2_PROVIDERS']:
+        abort(404)
+    redirect_uri = url_for('auth_callback', provider=provider, _external=True)
+    return oauth.create_client(provider).authorize_redirect(redirect_uri)
+
+@app.route('/auth/callback/<provider>')
+def auth_callback(provider):
+    if provider not in app.config['OAUTH2_PROVIDERS']:
+        abort(404)
+        
+    client = oauth.create_client(provider)
+    token = client.authorize_access_token()
+    user_info = client.parse_id_token(token)
+    
+    email = user_info.get('email')
+    if not email:
+        flash('Email not provided by the provider', 'error')
+        return redirect(url_for('login'))
+    
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        # Create new user
+        user = User(
+            email=email,
+            password=generate_password_hash(os.urandom(24).hex()),
+            is_verified=True
+        )
+        db.session.add(user)
+        db.session.commit()
+    
+    login_user(user)
+    return redirect(url_for('dashboard'))
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+        
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        
+        if User.query.filter_by(email=email).first():
+            flash('Email already exists', 'error')
+            return redirect(url_for('register'))
+            
+        user = User(
+            email=email,
+            password=generate_password_hash(password),
+            is_verified=False
+        )
+        db.session.add(user)
+        db.session.commit()
+        
+        send_confirmation_email(user)
+        flash('Confirmation email sent. Please check your inbox.', 'success')
+        return redirect(url_for('login'))
+        
+    return render_template('auth/register.html')
+
+@app.route('/verify/<token>')
+def verify_email(token):
+    user = User.verify_token(token)
+    if not user:
+        flash('Invalid or expired token', 'error')
+        return redirect(url_for('login'))
+    
+    user.is_verified = True
+    db.session.commit()
+    flash('Email verified successfully', 'success')
+    return redirect(url_for('dashboard'))
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('home'))
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    bookings = Booking.query.filter_by(user_id=current_user.id).order_by(Booking.date.desc()).limit(3).all()
+    return render_template('dashboard.html', bookings=bookings)
+
+@app.route('/hotels')
+def hotels():
+    page = request.args.get('page', 1, type=int)
+    per_page = 9
+    hotels = Hotel.query.paginate(page=page, per_page=per_page)
+    map_locations = [{
+        'lat': hotel.latitude,
+        'lng': hotel.longitude,
+        'name': hotel.name,
+        'id': hotel.id
+    } for hotel in hotels.items if hotel.latitude and hotel.longitude]
+    
+    return render_template('hotels.html', 
+                         hotels=hotels,
+                         map_locations=map_locations,
+                         map_api_key=app.config['GOOGLE_MAPS_API_KEY'])
+
+@app.route('/hotel/<int:id>')
+def hotel_detail(id):
+    hotel = Hotel.query.get_or_404(id)
+    reviews = Review.query.filter_by(hotel_id=id).order_by(Review.created_at.desc()).limit(5).all()
+    similar_hotels = Hotel.query.filter(
+        Hotel.location == hotel.location,
+        Hotel.id != hotel.id
+    ).limit(3).all()
+    
+    return render_template('hotel_detail.html',
+                         hotel=hotel,
+                         reviews=reviews,
+                         similar_hotels=similar_hotels)
+
+@app.route('/book-hotel', methods=['POST'])
+@login_required
+def book_hotel():
+    hotel_id = request.form.get('hotel_id')
+    check_in = request.form.get('check_in')
+    check_out = request.form.get('check_out')
+    guests = request.form.get('guests', 1)
+    
+    try:
+        booking = booking_service.create_hotel_booking(
+            user_id=current_user.id,
+            hotel_id=hotel_id,
+            check_in=datetime.strptime(check_in, '%Y-%m-%d'),
+            check_out=datetime.strptime(check_out, '%Y-%m-%d'),
+            guests=guests
+        )
+        
+        session['booking_id'] = booking.id
+        return redirect(url_for('payment'))
+    except Exception as e:
+        flash(str(e), 'error')
+        return redirect(request.referrer)
+
+@app.route('/payment')
+@login_required
+def payment():
+    booking_id = session.get('booking_id')
+    if not booking_id:
+        return redirect(url_for('dashboard'))
+        
+    booking = Booking.query.get(booking_id)
+    if not booking or booking.user_id != current_user.id:
+        return redirect(url_for('dashboard'))
+        
+    return render_template('payment.html',
+                         booking=booking,
+                         stripe_public_key=app.config['STRIPE_PUBLIC_KEY'])
+
+@app.route('/create-payment-intent', methods=['POST'])
+@login_required
+def create_payment_intent():
+    booking_id = session.get('booking_id')
+    if not booking_id:
+        return jsonify({'error': 'Invalid booking'}), 400
+        
+    booking = Booking.query.get(booking_id)
+    if not booking or booking.user_id != current_user.id:
+        return jsonify({'error': 'Invalid booking'}), 400
+        
+    try:
+        intent = payment_processor.create_intent(
+            amount=int(booking.total_amount * 100),  # in cents
+            currency='mad',
+            metadata={
+                'booking_id': booking.id,
+                'user_id': current_user.id
+            }
+        )
+        return jsonify({'clientSecret': intent.client_secret})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/payment-success')
+@login_required
+def payment_success():
+    booking_id = session.get('booking_id')
+    if not booking_id:
+        return redirect(url_for('dashboard'))
+        
+    booking = Booking.query.get(booking_id)
+    if not booking or booking.user_id != current_user.id:
+        return redirect(url_for('dashboard'))
+        
+    booking.status = 'confirmed'
+    db.session.commit()
+    session.pop('booking_id', None)
+    
+    flash('Payment successful! Your booking is confirmed.', 'success')
+    return redirect(url_for('booking_detail', id=booking.id))
+
+@app.route('/booking/<int:id>')
+@login_required
+def booking_detail(id):
+    booking = Booking.query.get_or_404(id)
+    if booking.user_id != current_user.id:
+        abort(403)
+        
+    return render_template('booking_detail.html', booking=booking)
+
+@app.route('/ai-recommendations', methods=['GET', 'POST'])
+@login_required
+def ai_recommendations():
+    if request.method == 'POST':
+        preferences = request.form.get('preferences')
+        budget = request.form.get('budget')
+        duration = request.form.get('duration')
+        
+        recommendations = recommendation_engine.generate(
+            user_id=current_user.id,
+            preferences=preferences,
+            budget=budget,
+            duration=duration
+        )
+        return render_template('recommendations.html', recommendations=recommendations)
+    return render_template('ai_recommendations.html')
+
+@app.route('/upload-image', methods=['POST'])
+@login_required
+def upload_image():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    
+    if file and allowed_file(file.filename):
+        filename = process_and_store_image(file)
+        return jsonify({'success': True, 'filename': filename})
+    return jsonify({'error': 'Invalid file type'}), 400
+
+@app.route('/add-review', methods=['POST'])
+@login_required
+def add_review():
+    hotel_id = request.form.get('hotel_id')
+    rating = request.form.get('rating')
+    comment = request.form.get('comment')
+    
+    if not hotel_id or not rating:
+        flash('Please provide a rating', 'error')
+        return redirect(request.referrer)
+    
+    review = Review(
+        user_id=current_user.id,
+        hotel_id=hotel_id,
+        rating=rating,
+        comment=comment
+    )
+    db.session.add(review)
+    db.session.commit()
+    
+    flash('Review submitted successfully', 'success')
+    return redirect(request.referrer)
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in {'png', 'jpg', 'jpeg', 'gif'}
+
+@app.context_processor
+def inject_globals():
+    return {
+        'current_year': datetime.now().year,
+        'map_api_key': app.config['GOOGLE_MAPS_API_KEY']
+    }
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
+EOL
+
+# 3. Update models with new fields
+cat > models/__init__.py << 'EOL'
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_login import UserMixin
+from datetime import datetime
+import jwt
+from time import time
+from app import app
+
+db = SQLAlchemy()
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(100), unique=True, nullable=False)
+    password = db.Column(db.String(200))
+    is_verified = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
+    profile_image = db.Column(db.String(100))
+    bookings = db.relationship('Booking', backref='user', lazy=True)
+    reviews = db.relationship('Review', backref='user', lazy=True)
+
+    def get_reset_token(self, expires_in=3600):
+        return jwt.encode(
+            {'reset_password': self.id, 'exp': time() + expires_in},
+            app.config['SECRET_KEY'], algorithm='HS256'
+        )
+
+    @staticmethod
+    def verify_token(token):
+        try:
+            id = jwt.decode(token, app.config['SECRET_KEY'],
+                            algorithms=['HS256'])['reset_password']
+        except:
+            return None
+        return User.query.get(id)
+
+class Hotel(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    location = db.Column(db.String(100), nullable=False)
+    address = db.Column(db.String(200))
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    price = db.Column(db.Float, nullable=False)
+    rating = db.Column(db.Float, default=0.0)
+    amenities = db.Column(db.Text)
+    description = db.Column(db.Text)
+    main_image = db.Column(db.String(100))
+    gallery = db.relationship('HotelImage', backref='hotel', lazy=True)
+    bookings = db.relationship('Booking', backref='hotel', lazy=True)
+    reviews = db.relationship('Review', backref='hotel', lazy=True)
+
+class HotelImage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    hotel_id = db.Column(db.Integer, db.ForeignKey('hotel.id'), nullable=False)
+    image_url = db.Column(db.String(200), nullable=False)
+    caption = db.Column(db.String(100))
+
+class Activity(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    location = db.Column(db.String(100), nullable=False)
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    price = db.Column(db.Float, nullable=False)
+    duration = db.Column(db.String(50))
+    difficulty = db.Column(db.String(20))
+    description = db.Column(db.Text)
+    main_image = db.Column(db.String(100))
+    gallery = db.relationship('ActivityImage', backref='activity', lazy=True)
+    bookings = db.relationship('Booking', backref='activity', lazy=True)
+
+class ActivityImage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    activity_id = db.Column(db.Integer, db.ForeignKey('activity.id'), nullable=False)
+    image_url = db.Column(db.String(200), nullable=False)
+    caption = db.Column(db.String(100))
+
+class Booking(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    hotel_id = db.Column(db.Integer, db.ForeignKey('hotel.id'))
+    activity_id = db.Column(db.Integer, db.ForeignKey('activity.id'))
+    date = db.Column(db.DateTime, default=datetime.utcnow)
+    check_in = db.Column(db.Date)
+    check_out = db.Column(db.Date)
+    guests = db.Column(db.Integer, default=1)
+    total_amount = db.Column(db.Float)
+    status = db.Column(db.String(20), default='pending')  # pending, confirmed, cancelled, completed
+    payment_intent = db.Column(db.String(100))
+    special_requests = db.Column(db.Text)
+
+class Review(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    hotel_id = db.Column(db.Integer, db.ForeignKey('hotel.id'), nullable=False)
+    rating = db.Column(db.Integer, nullable=False)
+    comment = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+EOL
+
+# 4. Create new services
+mkdir -p services
+cat > services/booking_service.py << 'EOL'
+from models import db, Booking
+from datetime import datetime
+from sqlalchemy.exc import SQLAlchemyError
+
+class BookingService:
+    def create_hotel_booking(self, user_id, hotel_id, check_in, check_out, guests=1):
+        try:
+            # Check for availability (simplified - in real app would have availability table)
+            existing_bookings = Booking.query.filter(
+                Booking.hotel_id == hotel_id,
+                Booking.check_out >= check_in,
+                Booking.check_in <= check_out,
+                Booking.status == 'confirmed'
+            ).count()
+            
+            if existing_bookings >= 10:  # Assuming max 10 rooms per hotel for demo
+                raise Exception('No available rooms for selected dates')
+            
+            # Calculate total amount (simplified)
+            nights = (check_out - check_in).days
+            total_amount = nights * 1000  # Fixed price for demo
+            
+            booking = Booking(
+                user_id=user_id,
+                hotel_id=hotel_id,
+                check_in=check_in,
+                check_out=check_out,
+                guests=guests,
+                total_amount=total_amount,
+                status='pending'
+            )
+            
+            db.session.add(booking)
+            db.session.commit()
+            return booking
+            
+        except SQLAlchemyError as e:
+            db.session.rollback()
+            raise Exception('Database error occurred')
+        except Exception as e:
+            raise e
+EOL
+
+cat > services/payment_processor.py << 'EOL'
+import stripe
+from app import app
+
+class PaymentProcessor:
+    def __init__(self):
+        stripe.api_key = app.config['STRIPE_SECRET_KEY']
+    
+    def create_intent(self, amount, currency, metadata=None):
+        try:
+            intent = stripe.PaymentIntent.create(
+                amount=amount,
+                currency=currency,
+                metadata=metadata or {},
+                automatic_payment_methods={
+                    'enabled': True,
+                },
+            )
+            return intent
+        except stripe.error.StripeError as e:
+            raise Exception(f'Stripe error: {str(e)}')
+EOL
+
+cat > services/map_service.py << 'EOL'
+import googlemaps
+from datetime import datetime
+
+class MapService:
+    def __init__(self, api_key):
+        self.gmaps = googlemaps.Client(key=api_key)
+    
+    def geocode(self, address):
+        try:
+            geocode_result = self.gmaps.geocode(address)
+            if geocode_result:
+                location = geocode_result[0]['geometry']['location']
+                return location['lat'], location['lng']
+            return None, None
+        except Exception:
+            return None, None
+    
+    def get_place_details(self, place_id):
+        try:
+            return self.gmaps.place(place_id)
+        except Exception:
+            return None
+    
+    def get_directions(self, origin, destination, mode='driving'):
+        try:
+            now = datetime.now()
+            directions = self.gmaps.directions(
+                origin,
+                destination,
+                mode=mode,
+                departure_time=now
+            )
+            return directions[0] if directions else None
+        except Exception:
+            return None
+EOL
+
+# 5. Create utils for social login and email
+mkdir -p utils
+cat > utils/social_login.py << 'EOL'
+from flask import redirect, url_for, flash
+from authlib.integrations.flask_client import OAuth
+from models import db, User
+from werkzeug.security import generate_password_hash
+
+def init_social_login(app, oauth):
+    # Google OAuth
+    oauth.register(
+        name='google',
+        client_id=app.config['OAUTH2_PROVIDERS']['google']['client_id'],
+        client_secret=app.config['OAUTH2_PROVIDERS']['google']['client_secret'],
+        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+        client_kwargs={
+            'scope': 'openid email profile'
+        }
+    )
+    
+    # Apple OAuth (simplified - requires additional configuration)
+    oauth.register(
+        name='apple',
+        client_id=app.config['OAUTH2_PROVIDERS']['apple']['client_id'],
+        client_kwargs={
+            'scope': 'name email'
+        },
+        authorize_url='https://appleid.apple.com/auth/authorize',
+        access_token_url='https://appleid.apple.com/auth/token'
+    )
+    
+    # Twitter OAuth
+    oauth.register(
+        name='twitter',
+        client_id=app.config['OAUTH2_PROVIDERS']['twitter']['client_id'],
+        client_secret=app.config['OAUTH2_PROVIDERS']['twitter']['client_secret'],
+        request_token_url='https://api.twitter.com/oauth/request_token',
+        request_token_params={
+            'scope': 'users.read tweet.read'
+        },
+        access_token_url='https://api.twitter.com/oauth/access_token',
+        authorize_url='https://api.twitter.com/oauth/authenticate',
+    )
+EOL
+
+cat > utils/email_service.py << 'EOL'
+from flask import url_for, render_template
+from app import app
+from models import User
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import os
+
+def send_confirmation_email(user):
+    token = user.get_reset_token()
+    confirm_url = url_for('verify_email', token=token, _external=True)
+    
+    subject = "Confirm Your VamosWay Account"
+    body = render_template('emails/confirm_email.html', confirm_url=confirm_url)
+    
+    msg = MIMEMultipart()
+    msg['From'] = app.config.get('MAIL_DEFAULT_SENDER', 'noreply@vamosway.com')
+    msg['To'] = user.email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'html'))
+    
+    try:
+        # In production, use a real email service
+        with smtplib.SMTP('localhost') as server:
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        return False
+EOL
+
+# 6. Update templates with new designs
+# Create base template with modern design
+cat > templates/base.html << 'EOL'
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VamosWay - {% block title %}{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+    <script src="https://maps.googleapis.com/maps/api/js?key={{ map_api_key }}&libraries=places&callback=initMap" async defer></script>
+    {% block head %}{% endblock %}
+</head>
+<body class="font-poppins bg-gray-50 text-gray-800">
+    <!-- Navigation -->
+    <nav class="bg-white shadow-lg sticky top-0 z-50">
+        <div class="container mx-auto px-4">
+            <div class="flex justify-between items-center py-4">
+                <a href="{{ url_for('home') }}" class="flex items-center space-x-2">
+                    <span class="text-2xl font-playfair font-bold text-green-700">VamosWay</span>
+                </a>
+                
+                <div class="hidden md:flex items-center space-x-8">
+                    <a href="{{ url_for('home') }}" class="nav-link">Home</a>
+                    <a href="{{ url_for('hotels') }}" class="nav-link">Hotels</a>
+                    <a href="{{ url_for('ai_recommendations') }}" class="nav-link">AI Planner</a>
+                    <a href="#about" class="nav-link">About</a>
+                    <a href="#contact" class="nav-link">Contact</a>
+                </div>
+                
+                <div class="flex items-center space-x-4">
+                    {% if current_user.is_authenticated %}
+                        <a href="{{ url_for('dashboard') }}" class="flex items-center space-x-2">
+                            {% if current_user.profile_image %}
+                                <img src="{{ url_for('static', filename='images/uploads/' + current_user.profile_image) }}" 
+                                     alt="Profile" class="w-8 h-8 rounded-full object-cover">
+                            {% else %}
+                                <div class="w-8 h-8 rounded-full bg-green-600 flex items-center justify-center text-white">
+                                    {{ current_user.email[0].upper() }}
+                                </div>
+                            {% endif %}
+                        </a>
+                        <a href="{{ url_for('logout') }}" class="text-gray-600 hover:text-green-700">
+                            <i class="fas fa-sign-out-alt"></i>
+                        </a>
+                    {% else %}
+                        <a href="{{ url_for('login') }}" class="text-gray-600 hover:text-green-700 px-3 py-1">
+                            Login
+                        </a>
+                        <a href="{{ url_for('register') }}" 
+                           class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg transition duration-300">
+                            Sign Up
+                        </a>
+                    {% endif %}
+                    <button class="md:hidden text-gray-600 focus:outline-none" id="mobile-menu-button">
+                        <i class="fas fa-bars text-xl"></i>
+                    </button>
+                </div>
+            </div>
+            
+            <!-- Mobile menu -->
+            <div class="md:hidden hidden pb-4" id="mobile-menu">
+                <a href="{{ url_for('home') }}" class="block py-2 px-4 hover:bg-gray-100">Home</a>
+                <a href="{{ url_for('hotels') }}" class="block py-2 px-4 hover:bg-gray-100">Hotels</a>
+                <a href="{{ url_for('ai_recommendations') }}" class="block py-2 px-4 hover:bg-gray-100">AI Planner</a>
+                <a href="#about" class="block py-2 px-4 hover:bg-gray-100">About</a>
+                <a href="#contact" class="block py-2 px-4 hover:bg-gray-100">Contact</a>
+                <div class="border-t mt-2 pt-2">
+                    {% if current_user.is_authenticated %}
+                        <a href="{{ url_for('dashboard') }}" class="block py-2 px-4 hover:bg-gray-100">Dashboard</a>
+                    {% else %}
+                        <a href="{{ url_for('login') }}" class="block py-2 px-4 hover:bg-gray-100">Login</a>
+                        <a href="{{ url_for('register') }}" class="block py-2 px-4 hover:bg-gray-100">Register</a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main content -->
+    <main>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="container mx-auto px-4 mt-4">
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }} p-4 mb-4 rounded-lg">
+                            {{ message }}
+                        </div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-gray-900 text-white py-12">
+        <div class="container mx-auto px-4">
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-8">
+                <div>
+                    <h3 class="text-xl font-playfair font-bold mb-4 text-green-400">VamosWay</h3>
+                    <p class="mb-4">Your personalized Moroccan travel experience powered by AI.</p>
+                    <div class="flex space-x-4">
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-facebook-f"></i></a>
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-twitter"></i></a>
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-instagram"></i></a>
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-linkedin-in"></i></a>
+                    </div>
+                </div>
+                
+                <div>
+                    <h4 class="text-lg font-semibold mb-4">Quick Links</h4>
+                    <ul class="space-y-2">
+                        <li><a href="{{ url_for('home') }}" class="hover:text-green-400">Home</a></li>
+                        <li><a href="{{ url_for('hotels') }}" class="hover:text-green-400">Hotels</a></li>
+                        <li><a href="{{ url_for('ai_recommendations') }}" class="hover:text-green-400">AI Planner</a></li>
+                        <li><a href="#about" class="hover:text-green-400">About Us</a></li>
+                        <li><a href="#contact" class="hover:text-green-400">Contact</a></li>
+                    </ul>
+                </div>
+                
+                <div>
+                    <h4 class="text-lg font-semibold mb-4">Support</h4>
+                    <ul class="space-y-2">
+                        <li><a href="#" class="hover:text-green-400">FAQs</a></li>
+                        <li><a href="#" class="hover:text-green-400">Privacy Policy</a></li>
+                        <li><a href="#" class="hover:text-green-400">Terms of Service</a></li>
+                        <li><a href="#" class="hover:text-green-400">Booking Conditions</a></li>
+                    </ul>
+                </div>
+                
+                <div>
+                    <h4 class="text-lg font-semibold mb-4">Contact Us</h4>
+                    <address class="not-italic">
+                        <p class="mb-2"><i class="fas fa-map-marker-alt mr-2 text-green-400"></i> Marrakech, Morocco</p>
+                        <p class="mb-2"><i class="fas fa-phone-alt mr-2 text-green-400"></i> +212 6 12 34 56 78</p>
+                        <p class="mb-2"><i class="fas fa-envelope mr-2 text-green-400"></i> contact@vamosway.com</p>
+                    </address>
+                </div>
+            </div>
+            
+            <div class="border-t border-gray-800 mt-8 pt-8 text-center text-gray-400">
+                <p>&copy; {{ current_year }} VamosWay. All rights reserved.</p>
+            </div>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+EOL
+
+# Create index.html with hero section and featured content
+cat > templates/index.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Discover Morocco with AI{% endblock %}
+
+{% block head %}
+<style>
+    .hero {
+        background: linear-gradient(rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0.6)), 
+                    url('{{ url_for("static", filename="images/morocco-hero.jpg") }}');
+        background-size: cover;
+        background-position: center;
+    }
+    
+    .search-card {
+        backdrop-filter: blur(10px);
+        background: rgba(255, 255, 255, 0.85);
+    }
+    
+    .feature-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+    }
+    
+    .testimonial-card {
+        background: rgba(255, 255, 255, 0.9);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<!-- Hero Section -->
+<section class="hero h-screen flex items-center justify-center text-white relative">
+    <div class="container mx-auto px-4 text-center">
+        <h1 class="text-4xl md:text-6xl font-playfair font-bold mb-6 animate-fadeIn">
+            Discover the Magic of Morocco
+        </h1>
+        <p class="text-xl md:text-2xl mb-8 max-w-2xl mx-auto animate-fadeIn delay-100">
+            AI-powered personalized travel experiences in the heart of North Africa
+        </p>
+        <div class="flex flex-col md:flex-row justify-center space-y-4 md:space-y-0 md:space-x-6 animate-fadeIn delay-200">
+            <a href="{{ url_for('ai_recommendations') }}" 
+               class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-8 rounded-lg text-lg transition duration-300">
+                Plan Your Trip
+            </a>
+            <a href="{{ url_for('hotels') }}" 
+               class="bg-transparent hover:bg-white hover:text-gray-900 text-white font-bold py-3 px-8 border-2 border-white rounded-lg text-lg transition duration-300">
+                Browse Hotels
+            </a>
+        </div>
+    </div>
+    
+    <div class="absolute bottom-10 left-0 right-0 text-center animate-bounce">
+        <a href="#explore" class="text-white text-2xl">
+            <i class="fas fa-chevron-down"></i>
+        </a>
+    </div>
+</section>
+
+<!-- Search Section -->
+<section id="explore" class="py-16 bg-gray-100 relative -mt-20 z-10">
+    <div class="container mx-auto px-4">
+        <div class="search-card max-w-5xl mx-auto p-6 rounded-xl shadow-lg">
+            <h2 class="text-2xl font-bold mb-6 text-gray-800">Where do you want to go?</h2>
+            
+            <form class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                    <label class="block text-gray-700 mb-2">Destination</label>
+                    <input type="text" placeholder="Marrakech, Fes, Sahara..." 
+                           class="w-full px-4 py-3 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500">
+                </div>
+                
+                <div>
+                    <label class="block text-gray-700 mb-2">Dates</label>
+                    <input type="text" placeholder="Select dates" 
+                           class="w-full px-4 py-3 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500">
+                </div>
+                
+                <div>
+                    <label class="block text-gray-700 mb-2">Travelers</label>
+                    <div class="flex">
+                        <input type="number" placeholder="2" min="1" 
+                               class="w-full px-4 py-3 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500">
+                        <button class="ml-2 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-lg transition duration-300">
+                            Search
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+</section>
+
+<!-- Features Section -->
+<section class="py-16 bg-white">
+    <div class="container mx-auto px-4">
+        <div class="text-center mb-12">
+            <h2 class="text-3xl font-playfair font-bold mb-4">Why Choose VamosWay?</h2>
+            <p class="text-gray-600 max-w-2xl mx-auto">
+                We combine local expertise with AI technology to create your perfect Moroccan adventure
+            </p>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <div class="feature-card bg-white p-8 rounded-xl shadow-md border border-gray-100 transition duration-300">
+                <div class="text-green-600 text-4xl mb-4">
+                    <i class="fas fa-robot"></i>
+                </div>
+                <h3 class="text-xl font-bold mb-3">AI-Powered Planning</h3>
+                <p class="text-gray-600">
+                    Our intelligent system learns your preferences to craft a personalized itinerary that matches your travel style.
+                </p>
+            </div>
+            
+            <div class="feature-card bg-white p-8 rounded-xl shadow-md border border-gray-100 transition duration-300">
+                <div class="text-green-600 text-4xl mb-4">
+                    <i class="fas fa-map-marked-alt"></i>
+                </div>
+                <h3 class="text-xl font-bold mb-3">Local Expertise</h3>
+                <p class="text-gray-600">
+                    Discover hidden gems and authentic experiences curated by our network of local Moroccan experts.
+                </p>
+            </div>
+            
+            <div class="feature-card bg-white p-8 rounded-xl shadow-md border border-gray-100 transition duration-300">
+                <div class="text-green-600 text-4xl mb-4">
+                    <i class="fas fa-hand-holding-heart"></i>
+                </div>
+                <h3 class="text-xl font-bold mb-3">Hassle-Free Booking</h3>
+                <p class="text-gray-600">
+                    One platform for all your travel needs - hotels, activities, and transportation with instant confirmation.
+                </p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Featured Hotels Section -->
+<section class="py-16 bg-gray-100">
+    <div class="container mx-auto px-4">
+        <div class="flex justify-between items-center mb-8">
+            <h2 class="text-3xl font-playfair font-bold">Featured Hotels & Riads</h2>
+            <a href="{{ url_for('hotels') }}" class="text-green-700 hover:text-green-800 font-semibold">
+                View All <i class="fas fa-arrow-right ml-1"></i>
+            </a>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {% for hotel in featured_hotels %}
+            <div class="bg-white rounded-xl overflow-hidden shadow-lg hover:shadow-xl transition duration-300">
+                <div class="relative h-64 overflow-hidden">
+                    <img src="{{ url_for('static', filename='images/hotels/' + hotel.main_image) if hotel.main_image else url_for('static', filename='images/default-hotel.jpg') }}" 
+                         alt="{{ hotel.name }}" class="w-full h-full object-cover transition duration-500 hover:scale-105">
+                    <div class="absolute top-4 right-4 bg-white px-3 py-1 rounded-full shadow-md">
+                        <span class="text-green-700 font-bold">{{ hotel.rating }} <i class="fas fa-star text-yellow-400"></i></span>
+                    </div>
+                </div>
+                <div class="p-6">
+                    <div class="flex justify-between items-start mb-2">
+                        <h3 class="text-xl font-bold">{{ hotel.name }}</h3>
+                        <span class="text-gray-600">
+                            <i class="fas fa-map-marker-alt text-green-600 mr-1"></i> {{ hotel.location }}
+                        </span>
+                    </div>
+                    <p class="text-gray-600 mb-4">{{ hotel.description|truncate(120) }}</p>
+                    <div class="flex justify-between items-center">
+                        <span class="text-xl font-bold text-green-700">{{ hotel.price }} MAD <span class="text-sm font-normal text-gray-500">/ night</span></span>
+                        <a href="{{ url_for('hotel_detail', id=hotel.id) }}" 
+                           class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg transition duration-300">
+                            View
+                        </a>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</section>
+
+<!-- Popular Activities Section -->
+<section class="py-16 bg-white">
+    <div class="container mx-auto px-4">
+        <div class="flex justify-between items-center mb-8">
+            <h2 class="text-3xl font-playfair font-bold">Popular Activities</h2>
+            <a href="#" class="text-green-700 hover:text-green-800 font-semibold">
+                View All <i class="fas fa-arrow-right ml-1"></i>
+            </a>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {% for activity in popular_activities %}
+            <div class="bg-white rounded-xl overflow-hidden shadow-lg hover:shadow-xl transition duration-300">
+                <div class="relative h-48 overflow-hidden">
+                    <img src="{{ url_for('static', filename='images/activities/' + activity.main_image) if activity.main_image else url_for('static', filename='images/default-activity.jpg') }}" 
+                         alt="{{ activity.name }}" class="w-full h-full object-cover transition duration-500 hover:scale-105">
+                </div>
+                <div class="p-6">
+                    <h3 class="text-xl font-bold mb-2">{{ activity.name }}</h3>
+                    <div class="flex items-center text-gray-600 mb-3">
+                        <i class="fas fa-clock mr-2"></i> {{ activity.duration }}
+                        <span class="mx-3">•</span>
+                        <i class="fas fa-bolt mr-2"></i> {{ activity.difficulty }}
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-xl font-bold text-green-700">{{ activity.price }} MAD</span>
+                        <button class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg transition duration-300">
+                            Book Now
+                        </button>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</section>
+
+<!-- AI Recommendation CTA -->
+<section class="py-16 bg-gradient-to-r from-green-800 to-blue-800 text-white">
+    <div class="container mx-auto px-4 text-center">
+        <h2 class="text-3xl font-playfair font-bold mb-6">Let AI Plan Your Perfect Trip</h2>
+        <p class="text-xl mb-8 max-w-2xl mx-auto">
+            Our intelligent system creates a personalized itinerary based on your preferences, budget, and travel style.
+        </p>
+        <a href="{{ url_for('ai_recommendations') }}" 
+           class="inline-block bg-white hover:bg-gray-100 text-green-800 font-bold py-3 px-8 rounded-lg text-lg transition duration-300">
+            Try Our AI Planner
+        </a>
+    </div>
+</section>
+
+<!-- Testimonials Section -->
+<section class="py-16 bg-gray-100">
+    <div class="container mx-auto px-4">
+        <h2 class="text-3xl font-playfair font-bold mb-12 text-center">What Our Travelers Say</h2>
+        
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <div class="testimonial-card p-8 rounded-xl shadow-md">
+                <div class="flex items-center mb-4">
+                    <img src="https://randomuser.me/api/portraits/women/32.jpg" alt="Sarah" class="w-12 h-12 rounded-full mr-4">
+                    <div>
+                        <h4 class="font-bold">Sarah Johnson</h4>
+                        <div class="flex text-yellow-400">
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                        </div>
+                    </div>
+                </div>
+                <p class="text-gray-600 italic">
+                    "VamosWay planned the most incredible 2-week trip through Morocco. The AI recommendations were spot on, and every hotel was better than the last!"
+                </p>
+            </div>
+            
+            <div class="testimonial-card p-8 rounded-xl shadow-md">
+                <div class="flex items-center mb-4">
+                    <img src="https://randomuser.me/api/portraits/men/54.jpg" alt="Michael" class="w-12 h-12 rounded-full mr-4">
+                    <div>
+                        <h4 class="font-bold">Michael Chen</h4>
+                        <div class="flex text-yellow-400">
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                        </div>
+                    </div>
+                </div>
+                <p class="text-gray-600 italic">
+                    "As a solo traveler, I was nervous about visiting Morocco, but VamosWay's personalized itinerary made everything so easy and safe."
+                </p>
+            </div>
+            
+            <div class="testimonial-card p-8 rounded-xl shadow-md">
+                <div class="flex items-center mb-4">
+                    <img src="https://randomuser.me/api/portraits/women/68.jpg" alt="Amina" class="w-12 h-12 rounded-full mr-4">
+                    <div>
+                        <h4 class="font-bold">Amina Alami</h4>
+                        <div class="flex text-yellow-400">
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star"></i>
+                            <i class="fas fa-star-half-alt"></i>
+                        </div>
+                    </div>
+                </div>
+                <p class="text-gray-600 italic">
+                    "Even as a Moroccan, I discovered new places through VamosWay. Their AI suggested hidden gems I never knew existed in my own country!"
+                </p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- About Section -->
+<section id="about" class="py-16 bg-white">
+    <div class="container mx-auto px-4">
+        <div class="flex flex-col md:flex-row items-center">
+            <div class="md:w-1/2 mb-8 md:mb-0 md:pr-8">
+                <h2 class="text-3xl font-playfair font-bold mb-6">Our Story</h2>
+                <p class="text-gray-600 mb-4">
+                    Founded in 2023, VamosWay was born from a passion for Moroccan travel and cutting-edge technology. 
+                    Our team of local experts and AI engineers came together to revolutionize how people experience Morocco.
+                </p>
+                <p class="text-gray-600 mb-6">
+                    We believe every traveler deserves a personalized journey that goes beyond the typical tourist routes. 
+                    Our AI analyzes thousands of data points to craft itineraries that match your unique preferences.
+                </p>
+                <a href="#" class="inline-block bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-lg transition duration-300">
+                    Learn More About Us
+                </a>
+            </div>
+            <div class="md:w-1/2">
+                <div class="relative rounded-xl overflow-hidden shadow-lg">
+                    <img src="{{ url_for('static', filename='images/team.jpg') }}" alt="VamosWay Team" class="w-full h-auto">
+                    <div class="absolute inset-0 bg-gradient-to-t from-black to-transparent opacity-70"></div>
+                    <div class="absolute bottom-0 left-0 p-6 text-white">
+                        <h3 class="text-xl font-bold">Meet Our Team</h3>
+                        <p>Local experts and tech innovators</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Newsletter Section -->
+<section class="py-16 bg-gray-100">
+    <div class="container mx-auto px-4 text-center">
+        <h2 class="text-3xl font-playfair font-bold mb-4">Get Travel Inspiration</h2>
+        <p class="text-gray-600 mb-8 max-w-2xl mx-auto">
+            Subscribe to our newsletter for exclusive deals, travel tips, and Moroccan cultural insights.
+        </p>
+        
+        <form class="max-w-md mx-auto flex">
+            <input type="email" placeholder="Your email address" 
+                   class="flex-grow px-4 py-3 rounded-l-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500">
+            <button type="submit" 
+                    class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-r-lg transition duration-300">
+                Subscribe
+            </button>
+        </form>
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Mobile menu toggle
+    document.getElementById('mobile-menu-button').addEventListener('click', function() {
+        const menu = document.getElementById('mobile-menu');
+        menu.classList.toggle('hidden');
+    });
+    
+    // Smooth scrolling for anchor links
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener('click', function(e) {
+            e.preventDefault();
+            const target = document.querySelector(this.getAttribute('href'));
+            if (target) {
+                window.scrollTo({
+                    top: target.offsetTop - 80,
+                    behavior: 'smooth'
+                });
+            }
+        });
+    });
+</script>
+{% endblock %}
+EOL
+
+# Create hotel detail template
+cat > templates/hotel_detail.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}{{ hotel.name }} - VamosWay{% endblock %}
+
+{% block head %}
+<style>
+    .hotel-gallery {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        grid-gap: 1rem;
+    }
+    
+    .gallery-main {
+        grid-column: span 2;
+        grid-row: span 2;
+    }
+    
+    .amenity-icon {
+        width: 24px;
+        height: 24px;
+        margin-right: 8px;
+        color: #059669;
+    }
+    
+    .booking-card {
+        position: sticky;
+        top: 20px;
+    }
+    
+    @media (max-width: 768px) {
+        .hotel-gallery {
+            grid-template-columns: 1fr;
+        }
+        
+        .gallery-main {
+            grid-column: span 1;
+            grid-row: span 1;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container mx-auto px-4 py-8">
+    <!-- Breadcrumbs -->
+    <nav class="flex mb-6" aria-label="Breadcrumb">
+        <ol class="inline-flex items-center space-x-1 md:space-x-3">
+            <li class="inline-flex items-center">
+                <a href="{{ url_for('home') }}" class="inline-flex items-center text-sm font-medium text-gray-700 hover:text-green-600">
+                    <i class="fas fa-home mr-2"></i>
+                    Home
+                </a>
+            </li>
+            <li>
+                <div class="flex items-center">
+                    <i class="fas fa-chevron-right text-gray-400 mx-2"></i>
+                    <a href="{{ url_for('hotels') }}" class="ml-1 text-sm font-medium text-gray-700 hover:text-green-600">
+                        Hotels
+                    </a>
+                </div>
+            </li>
+            <li aria-current="page">
+                <div class="flex items-center">
+                    <i class="fas fa-chevron-right text-gray-400 mx-2"></i>
+                    <span class="ml-1 text-sm font-medium text-gray-500">{{ hotel.name }}</span>
+                </div>
+            </li>
+        </ol>
+    </nav>
+    
+    <div class="flex flex-col lg:flex-row gap-8">
+        <!-- Main content -->
+        <div class="lg:w-2/3">
+            <!-- Hotel name and rating -->
+            <div class="mb-6">
+                <h1 class="text-3xl font-playfair font-bold mb-2">{{ hotel.name }}</h1>
+                <div class="flex items-center mb-4">
+                    <div class="flex items-center mr-4">
+                        {% for i in range(5) %}
+                            {% if i < hotel.rating|int %}
+                                <i class="fas fa-star text-yellow-400"></i>
+                            {% else %}
+                                <i class="far fa-star text-yellow-400"></i>
+                            {% endif %}
+                        {% endfor %}
+                        <span class="ml-2 text-gray-600">{{ hotel.rating }} (24 reviews)</span>
+                    </div>
+                    <div class="flex items-center text-gray-600">
+                        <i class="fas fa-map-marker-alt mr-1 text-green-600"></i>
+                        {{ hotel.location }}
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Hotel gallery -->
+            <div class="hotel-gallery mb-8">
+                <div class="gallery-main rounded-xl overflow-hidden">
+                    <img src="{{ url_for('static', filename='images/hotels/' + hotel.main_image) if hotel.main_image else url_for('static', filename='images/default-hotel.jpg') }}" 
+                         alt="{{ hotel.name }}" class="w-full h-full object-cover">
+                </div>
+                {% for i in range(4) %}
+                    <div class="rounded-xl overflow-hidden">
+                        <img src="https://source.unsplash.com/random/300x300/?morocco,hotel,{{i}}" 
+                             alt="Hotel image {{i}}" class="w-full h-full object-cover">
+                    </div>
+                {% endfor %}
+            </div>
+            
+            <!-- Hotel details -->
+            <div class="mb-8">
+                <h2 class="text-2xl font-playfair font-bold mb-4">About This Hotel</h2>
+                <p class="text-gray-700 mb-6">{{ hotel.description }}</p>
+                
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                    <div>
+                        <h3 class="text-xl font-semibold mb-3">Location</h3>
+                        <div id="hotel-map" class="h-64 rounded-xl overflow-hidden mb-4"></div>
+                        <p class="text-gray-700">{{ hotel.address }}</p>
+                    </div>
+                    
+                    <div>
+                        <h3 class="text-xl font-semibold mb-3">Amenities</h3>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div class="flex items-center">
+                                <i class="fas fa-wifi amenity-icon"></i>
+                                <span>Free WiFi</span>
+                            </div>
+                            <div class="flex items-center">
+                                <i class="fas fa-swimming-pool amenity-icon"></i>
+                                <span>Pool</span>
+                            </div>
+                            <div class="flex items-center">
+                                <i class="fas fa-utensils amenity-icon"></i>
+                                <span>Restaurant</span>
+                            </div>
+                            <div class="flex items-center">
+                                <i class="fas fa-spa amenity-icon"></i>
+                                <span>Spa</span>
+                            </div>
+                            <div class="flex items-center">
+                                <i class="fas fa-dumbbell amenity-icon"></i>
+                                <span>Gym</span>
+                            </div>
+                            <div class="flex items-center">
+                                <i class="fas fa-parking amenity-icon"></i>
+                                <span>Parking</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Reviews -->
+            <div class="mb-8">
+                <h2 class="text-2xl font-playfair font-bold mb-4">Guest Reviews</h2>
+                
+                {% if reviews %}
+                    {% for review in reviews %}
+                    <div class="border-b border-gray-200 pb-6 mb-6">
+                        <div class="flex justify-between items-start mb-2">
+                            <div>
+                                <h4 class="font-bold">{{ review.user.email }}</h4>
+                                <div class="flex items-center text-yellow-400 mb-2">
+                                    {% for i in range(5) %}
+                                        {% if i < review.rating %}
+                                            <i class="fas fa-star"></i>
+                                        {% else %}
+                                            <i class="far fa-star"></i>
+                                        {% endif %}
+                                    {% endfor %}
+                                </div>
+                            </div>
+                            <span class="text-gray-500 text-sm">{{ review.created_at.strftime('%B %d, %Y') }}</span>
+                        </div>
+                        <p class="text-gray-700">{{ review.comment }}</p>
+                    </div>
+                    {% endfor %}
+                    
+                    <a href="#" class="text-green-600 hover:text-green-800 font-semibold">
+                        See all reviews <i class="fas fa-arrow-right ml-1"></i>
+                    </a>
+                {% else %}
+                    <p class="text-gray-600">No reviews yet. Be the first to review!</p>
+                {% endif %}
+            </div>
+            
+            <!-- Add review form -->
+            {% if current_user.is_authenticated %}
+            <div class="bg-gray-50 p-6 rounded-xl">
+                <h3 class="text-xl font-semibold mb-4">Write a Review</h3>
+                <form method="POST" action="{{ url_for('add_review') }}">
+                    <input type="hidden" name="hotel_id" value="{{ hotel.id }}">
+                    
+                    <div class="mb-4">
+                        <label class="block text-gray-700 mb-2">Your Rating</label>
+                        <div class="rating-stars flex">
+                            {% for i in range(5, 0, -1) %}
+                                <input type="radio" id="star{{i}}" name="rating" value="{{i}}" class="hidden" {% if i == 5 %}checked{% endif %}>
+                                <label for="star{{i}}" class="text-2xl cursor-pointer text-gray-300 hover:text-yellow-400">
+                                    <i class="fas fa-star"></i>
+                                </label>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    
+                    <div class="mb-4">
+                        <label class="block text-gray-700 mb-2">Your Review</label>
+                        <textarea name="comment" rows="4" 
+                                  class="w-full px-4 py-2 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500"></textarea>
+                    </div>
+                    
+                    <button type="submit" 
+                            class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-6 rounded-lg transition duration-300">
+                        Submit Review
+                    </button>
+                </form>
+            </div>
+            {% else %}
+            <div class="bg-gray-50 p-6 rounded-xl text-center">
+                <p class="mb-4">Want to share your experience?</p>
+                <a href="{{ url_for('login') }}" 
+                   class="inline-block bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-6 rounded-lg transition duration-300">
+                    Login to Write a Review
+                </a>
+            </div>
+            {% endif %}
+        </div>
+        
+        <!-- Booking sidebar -->
+        <div class="lg:w-1/3">
+            <div class="booking-card bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <div class="flex justify-between items-start mb-4">
+                    <h2 class="text-xl font-bold">Book Your Stay</h2>
+                    <span class="text-2xl font-bold text-green-700">{{ hotel.price }} MAD <span class="text-sm font-normal text-gray-500">/ night</span></span>
+                </div>
+                
+                <form method="POST" action="{{ url_for('book_hotel') }}">
+                    <input type="hidden" name="hotel_id" value="{{ hotel.id }}">
+                    
+                    <div class="mb-4">
+                        <label class="block text-gray-700 mb-2">Check-in Date</label>
+                        <input type="date" name="check_in" 
+                               class="w-full px-4 py-3 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500" 
+                               min="{{ date.today().strftime('%Y-%m-%d') }}">
+                    </div>
+                    
+                    <div class="mb-4">
+                        <label class="block text-gray-700 mb-2">Check-out Date</label>
+                        <input type="date" name="check_out" 
+                               class="w-full px-4 py-3 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500" 
+                               min="{{ date.today().strftime('%Y-%m-%d') }}">
+                    </div>
+                    
+                    <div class="mb-6">
+                        <label class="block text-gray-700 mb-2">Guests</label>
+                        <select name="guests" class="w-full px-4 py-3 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500">
+                            {% for i in range(1, 9) %}
+                                <option value="{{i}}">{{i}} {% if i == 1 %}guest{% else %}guests{% endif %}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    
+                    <button type="submit" 
+                            class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg transition duration-300">
+                        Book Now
+                    </button>
+                </form>
+                
+                <div class="mt-6 pt-6 border-t border-gray-200">
+                    <h3 class="font-semibold mb-2">Why Book With Us?</h3>
+                    <ul class="space-y-2 text-sm text-gray-600">
+                        <li class="flex items-center">
+                            <i class="fas fa-check-circle text-green-600 mr-2"></i>
+                            Best price guarantee
+                        </li>
+                        <li class="flex items-center">
+                            <i class="fas fa-check-circle text-green-600 mr-2"></i>
+                            Instant confirmation
+                        </li>
+                        <li class="flex items-center">
+                            <i class="fas fa-check-circle text-green-600 mr-2"></i>
+                            No booking fees
+                        </li>
+                        <li class="flex items-center">
+                            <i class="fas fa-check-circle text-green-600 mr-2"></i>
+                            24/7 customer support
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Similar hotels -->
+    {% if similar_hotels %}
+    <div class="mt-16">
+        <h2 class="text-2xl font-playfair font-bold mb-6">Similar Hotels</h2>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {% for hotel in similar_hotels %}
+            <div class="bg-white rounded-xl overflow-hidden shadow-lg hover:shadow-xl transition duration-300">
+                <div class="relative h-48 overflow-hidden">
+                    <img src="{{ url_for('static', filename='images/hotels/' + hotel.main_image) if hotel.main_image else url_for('static', filename='images/default-hotel.jpg') }}" 
+                         alt="{{ hotel.name }}" class="w-full h-full object-cover transition duration-500 hover:scale-105">
+                </div>
+                <div class="p-6">
+                    <h3 class="text-xl font-bold mb-2">{{ hotel.name }}</h3>
+                    <div class="flex items-center text-gray-600 mb-3">
+                        <i class="fas fa-map-marker-alt mr-2 text-green-600"></i>
+                        {{ hotel.location }}
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-xl font-bold text-green-700">{{ hotel.price }} MAD <span class="text-sm font-normal text-gray-500">/ night</span></span>
+                        <a href="{{ url_for('hotel_detail', id=hotel.id) }}" 
+                           class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg transition duration-300">
+                            View
+                        </a>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+{% block scripts %}
+<script>
+    // Initialize map
+    function initMap() {
+        const location = { lat: {{ hotel.latitude }}, lng: {{ hotel.longitude }} };
+        const map = new google.maps.Map(document.getElementById("hotel-map"), {
+            zoom: 15,
+            center: location,
+            mapId: 'DEMO_MAP_ID',
+        });
+        
+        new google.maps.Marker({
+            position: location,
+            map: map,
+            title: "{{ hotel.name }}",
+        });
+    }
+    
+    // Rating stars interaction
+    document.querySelectorAll('.rating-stars input').forEach(input => {
+        input.addEventListener('change', function() {
+            const rating = parseInt(this.value);
+            const stars = this.parentElement.querySelectorAll('label');
+            
+            stars.forEach((star, index) => {
+                if (index < rating) {
+                    star.classList.add('text-yellow-400');
+                    star.classList.remove('text-gray-300');
+                } else {
+                    star.classList.add('text-gray-300');
+                    star.classList.remove('text-yellow-400');
+                }
+            });
+        });
+    });
+    
+    // Date validation
+    document.querySelector('input[name="check_in"]').addEventListener('change', function() {
+        const checkOutInput = document.querySelector('input[name="check_out"]');
+        checkOutInput.min = this.value;
+        
+        if (new Date(checkOutInput.value) < new Date(this.value)) {
+            checkOutInput.value = this.value;
+        }
+    });
+</script>
+{% endblock %}
+{% endblock %}
+EOL
+
+# Create payment template
+cat > templates/payment.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Payment - VamosWay{% endblock %}
+
+{% block content %}
+<div class="container mx-auto px-4 py-8">
+    <div class="max-w-4xl mx-auto">
+        <div class="flex items-center mb-6">
+            <a href="{{ url_for('hotel_detail', id=booking.hotel.id) }}" class="text-green-600 hover:text-green-800 mr-2">
+                <i class="fas fa-arrow-left"></i>
+            </a>
+            <h1 class="text-2xl font-bold">Complete Your Booking</h1>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <!-- Booking summary -->
+            <div class="md:col-span-2">
+                <div class="bg-white rounded-xl shadow-md p-6 mb-6">
+                    <h2 class="text-xl font-semibold mb-4">Your Booking Details</h2>
+                    
+                    <div class="flex flex-col md:flex-row mb-6">
+                        <div class="md:w-1/3 mb-4 md:mb-0">
+                            <img src="{{ url_for('static', filename='images/hotels/' + booking.hotel.main_image) if booking.hotel.main_image else url_for('static', filename='images/default-hotel.jpg') }}" 
+                                 alt="{{ booking.hotel.name }}" class="w-full h-auto rounded-lg">
+                        </div>
+                        <div class="md:w-2/3 md:pl-6">
+                            <h3 class="text-lg font-bold mb-2">{{ booking.hotel.name }}</h3>
+                            <p class="text-gray-600 mb-3">
+                                <i class="fas fa-map-marker-alt text-green-600 mr-2"></i>
+                                {{ booking.hotel.location }}
+                            </p>
+                            
+                            <div class="grid grid-cols-2 gap-4 mb-4">
+                                <div>
+                                    <p class="text-sm text-gray-500">Check-in</p>
+                                    <p class="font-semibold">{{ booking.check_in.strftime('%b %d, %Y') }}</p>
+                                </div>
+                                <div>
+                                    <p class="text-sm text-gray-500">Check-out</p>
+                                    <p class="font-semibold">{{ booking.check_out.strftime('%b %d, %Y') }}</p>
+                                </div>
+                                <div>
+                                    <p class="text-sm text-gray-500">Guests</p>
+                                    <p class="font-semibold">{{ booking.guests }} {% if booking.guests == 1 %}guest{% else %}guests{% endif %}</p>
+                                </div>
+                                <div>
+                                    <p class="text-sm text-gray-500">Nights</p>
+                                    <p class="font-semibold">{{ (booking.check_out - booking.check_in).days }}</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="border-t border-gray-200 pt-4">
+                        <h3 class="font-semibold mb-3">Price Breakdown</h3>
+                        <div class="space-y-2 mb-4">
+                            <div class="flex justify-between">
+                                <span>{{ booking.hotel.price }} MAD x {{ (booking.check_out - booking.check_in).days }} nights</span>
+                                <span>{{ booking.hotel.price * (booking.check_out - booking.check_in).days }} MAD</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span>Service fee</span>
+                                <span>200 MAD</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span>Taxes</span>
+                                <span>150 MAD</span>
+                            </div>
+                        </div>
+                        <div class="flex justify-between border-t border-gray-200 pt-3 font-bold text-lg">
+                            <span>Total</span>
+                            <span>{{ booking.total_amount }} MAD</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Guest information -->
+                <div class="bg-white rounded-xl shadow-md p-6">
+                    <h2 class="text-xl font-semibold mb-4">Guest Information</h2>
+                    <div class="mb-4">
+                        <label class="block text-gray-700 mb-2">Full Name</label>
+                        <input type="text" class="w-full px-4 py-2 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500" 
+                               value="{{ current_user.email.split('@')[0] }}" disabled>
+                    </div>
+                    <div class="mb-4">
+                        <label class="block text-gray-700 mb-2">Email</label>
+                        <input type="email" class="w-full px-4 py-2 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500" 
+                               value="{{ current_user.email }}" disabled>
+                    </div>
+                    <div>
+                        <label class="block text-gray-700 mb-2">Special Requests (Optional)</label>
+                        <textarea rows="3" class="w-full px-4 py-2 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500"></textarea>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Payment section -->
+            <div>
+                <div class="bg-white rounded-xl shadow-md p-6 sticky top-4">
+                    <h2 class="text-xl font-semibold mb-4">Payment Method</h2>
+                    
+                    <div class="mb-6">
+                        <div id="payment-element">
+                            <!-- Stripe Elements will be inserted here -->
+                        </div>
+                    </div>
+                    
+                    <button id="submit-button" 
+                            class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg transition duration-300 disabled:opacity-50">
+                        Pay {{ booking.total_amount }} MAD
+                    </button>
+                    
+                    <p class="text-xs text-gray-500 mt-4">
+                        By completing your booking, you agree to our Terms of Service and Privacy Policy.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://js.stripe.com/v3/"></script>
+<script>
+    const stripe = Stripe('{{ stripe_public_key }}');
+    const options = {
+        clientSecret: '{{ booking.payment_intent }}',
+        appearance: {
+            theme: 'stripe',
+            variables: {
+                colorPrimary: '#059669',
+                colorBackground: '#ffffff',
+                colorText: '#1f2937',
+                colorDanger: '#dc2626',
+                fontFamily: 'Poppins, system-ui, sans-serif',
+                spacingUnit: '4px',
+                borderRadius: '8px'
+            }
+        }
+    };
+    
+    const elements = stripe.elements(options);
+    const paymentElement = elements.create('payment');
+    paymentElement.mount('#payment-element');
+    
+    const form = document.getElementById('payment-form');
+    const submitButton = document.getElementById('submit-button');
+    
+    submitButton.addEventListener('click', async (e) => {
+        e.preventDefault();
+        submitButton.disabled = true;
+        
+        const { error } = await stripe.confirmPayment({
+            elements,
+            confirmParams: {
+                return_url: '{{ url_for("payment_success", _external=True) }}',
+            }
+        });
+        
+        if (error) {
+            submitButton.disabled = false;
+            alert(error.message);
+        }
+    });
+</script>
+{% endblock %}
+EOL
+
+# Create booking detail template
+cat > templates/booking_detail.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Booking Confirmation - VamosWay{% endblock %}
+
+{% block content %}
+<div class="container mx-auto px-4 py-8">
+    <div class="max-w-4xl mx-auto text-center">
+        <div class="mb-8">
+            <div class="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                <i class="fas fa-check text-green-600 text-3xl"></i>
+            </div>
+            <h1 class="text-3xl font-bold mb-2">Booking Confirmed!</h1>
+            <p class="text-gray-600">Your reservation at {{ booking.hotel.name }} is confirmed</p>
+            <p class="text-gray-600">Confirmation #: {{ booking.id }}</p>
+        </div>
+        
+        <div class="bg-white rounded-xl shadow-md overflow-hidden mb-8">
+            <div class="p-6">
+                <div class="flex flex-col md:flex-row mb-6">
+                    <div class="md:w-1/3 mb-4 md:mb-0">
+                        <img src="{{ url_for('static', filename='images/hotels/' + booking.hotel.main_image) if booking.hotel.main_image else url_for('static', filename='images/default-hotel.jpg') }}" 
+                             alt="{{ booking.hotel.name }}" class="w-full h-auto rounded-lg">
+                    </div>
+                    <div class="md:w-2/3 md:pl-6 text-left">
+                        <h3 class="text-xl font-bold mb-2">{{ booking.hotel.name }}</h3>
+                        <p class="text-gray-600 mb-3">
+                            <i class="fas fa-map-marker-alt text-green-600 mr-2"></i>
+                            {{ booking.hotel.location }}
+                        </p>
+                        
+                        <div class="grid grid-cols-2 gap-4 mb-4">
+                            <div>
+                                <p class="text-sm text-gray-500">Check-in</p>
+                                <p class="font-semibold">{{ booking.check_in.strftime('%b %d, %Y') }}</p>
+                            </div>
+                            <div>
+                                <p class="text-sm text-gray-500">Check-out</p>
+                                <p class="font-semibold">{{ booking.check_out.strftime('%b %d, %Y') }}</p>
+                            </div>
+                            <div>
+                                <p class="text-sm text-gray-500">Guests</p>
+                                <p class="font-semibold">{{ booking.guests }} {% if booking.guests == 1 %}guest{% else %}guests{% endif %}</p>
+                            </div>
+                            <div>
+                                <p class="text-sm text-gray-500">Booking Date</p>
+                                <p class="font-semibold">{{ booking.date.strftime('%b %d, %Y') }}</p>
+                            </div>
+                        </div>
+                        
+                        <div class="border-t border-gray-200 pt-4">
+                            <div class="flex justify-between font-bold">
+                                <span>Total Paid</span>
+                                <span>{{ booking.total_amount }} MAD</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="bg-gray-50 px-6 py-4">
+                <h3 class="font-semibold mb-2">What's Next?</h3>
+                <p class="text-sm text-gray-600">
+                    You'll receive a confirmation email with all the details. Contact the hotel directly for any special requests.
+                </p>
+            </div>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <a href="{{ url_for('dashboard') }}" 
+               class="bg-white hover:bg-gray-100 text-gray-800 font-bold py-3 px-4 border border-gray-300 rounded-lg transition duration-300">
+                <i class="fas fa-tachometer-alt mr-2"></i> Go to Dashboard
+            </a>
+            <a href="{{ url_for('hotel_detail', id=booking.hotel.id) }}" 
+               class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg transition duration-300">
+                <i class="fas fa-hotel mr-2"></i> View Hotel
+            </a>
+        </div>
+    </div>
+</div>
+{% endblock %}
+EOL
+
+# Update CSS with modern styles
+cat > static/css/main.css << 'EOL'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom styles */
+body {
+    font-family: 'Poppins', sans-serif;
+}
+
+.font-playfair {
+    font-family: 'Playfair Display', serif;
+}
+
+.nav-link {
+    @apply text-gray-700 hover:text-green-600 transition duration-300;
+}
+
+.alert {
+    @apply p-4 rounded-lg mb-4;
+}
+
+.alert-success {
+    @apply bg-green-100 text-green-800 border border-green-200;
+}
+
+.alert-error {
+    @apply bg-red-100 text-red-800 border border-red-200;
+}
+
+/* Animations */
+.animate-fadeIn {
+    animation: fadeIn 0.8s ease-out;
+}
+
+.animate-fadeIn.delay-100 {
+    animation-delay: 0.1s;
+}
+
+.animate-fadeIn.delay-200 {
+    animation-delay: 0.2s;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-bounce {
+    animation: bounce 2s infinite;
+}
+
+@keyframes bounce {
+    0%, 20%, 50%, 80%, 100% { transform: translateY(0); }
+    40% { transform: translateY(-20px); }
+    60% { transform: translateY(-10px); }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #059669;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #047857;
+}
+
+/* Tooltip */
+.tooltip {
+    @apply invisible absolute;
+}
+
+.has-tooltip:hover .tooltip {
+    @apply visible z-50;
+}
+
+/* Rating stars */
+.rating-stars label {
+    @apply cursor-pointer;
+}
+
+.rating-stars input:checked ~ label {
+    @apply text-yellow-400;
+}
+
+.rating-stars:hover label {
+    @apply text-yellow-400;
+}
+
+.rating-stars label:hover ~ label {
+    @apply text-gray-300;
+}
+EOL
+
+# Update JavaScript with new functionality
+cat > static/js/main.js << 'EOL'
+document.addEventListener('DOMContentLoaded', function() {
+    // Mobile menu toggle
+    const mobileMenuButton = document.getElementById('mobile-menu-button');
+    const mobileMenu = document.getElementById('mobile-menu');
+    
+    if (mobileMenuButton && mobileMenu) {
+        mobileMenuButton.addEventListener('click', function() {
+            mobileMenu.classList.toggle('hidden');
+        });
+    }
+    
+    // Smooth scrolling for anchor links
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener('click', function(e) {
+            e.preventDefault();
+            const targetId = this.getAttribute('href');
+            const target = document.querySelector(targetId);
+            
+            if (target) {
+                window.scrollTo({
+                    top: target.offsetTop - 80,
+                    behavior: 'smooth'
+                });
+                
+                // Update URL without jumping
+                if (history.pushState) {
+                    history.pushState(null, null, targetId);
+                } else {
+                    window.location.hash = targetId;
+                }
+            }
+        });
+    });
+    
+    // Form validation
+    const forms = document.querySelectorAll('form');
+    forms.forEach(form => {
+        form.addEventListener('submit', function(e) {
+            let isValid = true;
+            const requiredInputs = form.querySelectorAll('input[required], select[required], textarea[required]');
+            
+            requiredInputs.forEach(input => {
+                if (!input.value.trim()) {
+                    input.classList.add('border-red-500');
+                    isValid = false;
+                } else {
+                    input.classList.remove('border-red-500');
+                }
+            });
+            
+            if (!isValid) {
+                e.preventDefault();
+                alert('Please fill in all required fields');
+            }
+        });
+    });
+    
+    // Initialize tooltips
+    const tooltips = document.querySelectorAll('[data-tooltip]');
+    tooltips.forEach(element => {
+        element.addEventListener('mouseenter', showTooltip);
+        element.addEventListener('mouseleave', hideTooltip);
+    });
+    
+    function showTooltip() {
+        const tooltipText = this.getAttribute('data-tooltip');
+        const tooltip = document.createElement('div');
+        tooltip.className = 'absolute z-50 bg-black text-white text-xs rounded py-1 px-2 mt-1';
+        tooltip.textContent = tooltipText;
+        this.appendChild(tooltip);
+    }
+    
+    function hideTooltip() {
+        const tooltip = this.querySelector('div');
+        if (tooltip) {
+            this.removeChild(tooltip);
+        }
+    }
+    
+    // Date picker initialization
+    const dateInputs = document.querySelectorAll('input[type="date"]');
+    dateInputs.forEach(input => {
+        // Set minimum date to today
+        if (!input.min) {
+            const today = new Date().toISOString().split('T')[0];
+            input.min = today;
+        }
+    });
+    
+    // Initialize Google Maps if needed
+    if (typeof google !== 'undefined') {
+        // Custom map initialization can go here
+    }
+    
+    // Booking date validation
+    const checkInInput = document.querySelector('input[name="check_in"]');
+    const checkOutInput = document.querySelector('input[name="check_out"]');
+    
+    if (checkInInput && checkOutInput) {
+        checkInInput.addEventListener('change', function() {
+            checkOutInput.min = this.value;
+            
+            if (new Date(checkOutInput.value) < new Date(this.value)) {
+                checkOutInput.value = this.value;
+            }
+        });
+    }
+    
+    // Payment form handling
+    const paymentForm = document.getElementById('payment-form');
+    if (paymentForm) {
+        paymentForm.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            // Payment processing would be handled by Stripe.js
+        });
+    }
+    
+    // Rating stars interaction
+    const ratingContainers = document.querySelectorAll('.rating-container');
+    ratingContainers.forEach(container => {
+        const stars = container.querySelectorAll('input[type="radio"]');
+        stars.forEach(star => {
+            star.addEventListener('change', function() {
+                const rating = this.value;
+                // You can add additional logic here if needed
+            });
+        });
+    });
+    
+    // Image gallery functionality
+    const galleryThumbnails = document.querySelectorAll('.gallery-thumbnail');
+    const galleryMainImage = document.querySelector('.gallery-main-image');
+    
+    if (galleryThumbnails.length && galleryMainImage) {
+        galleryThumbnails.forEach(thumbnail => {
+            thumbnail.addEventListener('click', function() {
+                const newSrc = this.getAttribute('data-full');
+                galleryMainImage.src = newSrc;
+                
+                // Update active thumbnail
+                galleryThumbnails.forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
+            });
+        });
+    }
+});
+EOL
+
+# Update environment file with new keys
+cat > .env << 'EOL'
+SECRET_KEY=your-secret-key-here
+OPENAI_API_KEY=your-openai-api-key-here
+AI_MODEL=gpt-4
+GOOGLE_MAPS_API_KEY=your-google-maps-api-key
+STRIPE_PUBLIC_KEY=your-stripe-public-key
+STRIPE_SECRET_KEY=your-stripe-secret-key
+GOOGLE_CLIENT_ID=your-google-oauth-client-id
+GOOGLE_CLIENT_SECRET=your-google-oauth-client-secret
+APPLE_CLIENT_ID=your-apple-client-id
+APPLE_TEAM_ID=your-apple-team-id
+APPLE_KEY_ID=your-apple-key-id
+APPLE_PRIVATE_KEY=your-apple-private-key
+TWITTER_CLIENT_ID=your-twitter-client-id
+TWITTER_CLIENT_SECRET=your-twitter-client-secret
+MAIL_SERVER=smtp.example.com
+MAIL_PORT=587
+MAIL_USE_TLS=true
+MAIL_USERNAME=your-email@example.com
+MAIL_PASSWORD=your-email-password
+MAIL_DEFAULT_SENDER=no-reply@vamosway.com
+EOL
+
+# Create sample data script
+cat > create_sample_data.py << 'EOL'
+from app import app, db
+from models import User, Hotel, Activity, Review
+from datetime import datetime, timedelta
+import random
+
+def create_sample_data():
+    with app.app_context():
+        # Clear existing data
+        db.drop_all()
+        db.create_all()
+        
+        # Create sample users
+        users = [
+            User(email='user1@example.com', password='password1', is_verified=True),
+            User(email='user2@example.com', password='password2', is_verified=True),
+            User(email='user3@example.com', password='password3', is_verified=True),
+        ]
+        db.session.add_all(users)
+        db.session.commit()
+        
+        # Create sample hotels
+        moroccan_cities = ['Marrakech', 'Fes', 'Casablanca', 'Tangier', 'Chefchaouen', 'Essaouira', 'Rabat', 'Agadir']
+        hotel_descriptions = [
+            "A luxurious riad in the heart of the medina with traditional Moroccan architecture and modern amenities.",
+            "Beautiful boutique hotel with a rooftop terrace offering stunning views of the city.",
+            "Eco-friendly resort with spacious rooms, swimming pool, and spa facilities.",
+            "Historic palace converted into a 5-star hotel with exquisite decor and gourmet restaurant.",
+            "Charming guesthouse with authentic Moroccan hospitality and home-cooked meals.",
+        ]
+        
+        hotels = []
+        for i in range(15):
+            city = random.choice(moroccan_cities)
+            price = random.randint(500, 3000)
+            rating = round(random.uniform(3.5, 5.0), 1)
+            
+            hotel = Hotel(
+                name=f"{random.choice(['Riad', 'Hotel', 'Resort', 'Palace'])} {random.choice(['Al Andalus', 'Atlas', 'Sahara', 'Oasis', 'Mogador', 'Zamzam'])}",
+                location=city,
+                address=f"{random.randint(1, 200)} {random.choice(['Rue', 'Avenue'])} {random.choice(['Mohammed V', 'Hassan II', 'Ibn Battuta', 'Al Qods'])}",
+                latitude=31.63 + random.uniform(-0.5, 0.5),
+                longitude=-8.00 + random.uniform(-0.5, 0.5),
+                price=price,
+                rating=rating,
+                amenities=", ".join(random.sample(['Pool', 'Spa', 'Restaurant', 'Gym', 'WiFi', 'Parking', 'Air Conditioning', 'Breakfast'], 5)),
+                description=random.choice(hotel_descriptions),
+                main_image=f"hotel-{i+1}.jpg" if i < 10 else None
+            )
+            hotels.append(hotel)
+        
+        db.session.add_all(hotels)
+        db.session.commit()
+        
+        # Create sample activities
+        activity_names = [
+            "Sahara Desert Camp Experience",
+            "Atlas Mountains Trekking Tour",
+            "Marrakech Food Tasting Walk",
+            "Fes Medina Guided Tour",
+            "Chefchaouen Photography Workshop",
+            "Traditional Moroccan Cooking Class",
+            "Hammam & Spa Day Experience",
+            "Hot Air Balloon Ride at Sunrise",
+            "Surfing Lessons in Taghazout",
+            "Historical Rabat Walking Tour"
+        ]
+        
+        activities = []
+        for i, name in enumerate(activity_names):
+            city = random.choice(moroccan_cities)
+            price = random.randint(200, 1500)
+            duration = f"{random.randint(2, 8)} hours"
+            
+            activity = Activity(
+                name=name,
+                location=city,
+                latitude=31.63 + random.uniform(-0.5, 0.5),
+                longitude=-8.00 + random.uniform(-0.5, 0.5),
+                price=price,
+                duration=duration,
+                difficulty=random.choice(['Easy', 'Moderate', 'Challenging']),
+                description=f"Experience the best of {city} with this {name.lower()}. Our expert guides will ensure you have an unforgettable time.",
+                main_image=f"activity-{i+1}.jpg" if i < 8 else None
+            )
+            activities.append(activity)
+        
+        db.session.add_all(activities)
+        db.session.commit()
+        
+        # Create sample reviews
+        for hotel in hotels:
+            for i in range(random.randint(3, 8)):
+                user = random.choice(users)
+                rating = random.randint(3, 5)
+                comments = [
+                    "Great experience, would definitely recommend!",
+                    "Beautiful property with excellent service.",
+                    "The location was perfect for exploring the city.",
+                    "Some issues with cleanliness but overall good stay.",
+                    "Absolutely stunning riad with amazing staff.",
+                    "The breakfast was delicious every morning.",
+                    "A bit noisy at night but comfortable rooms.",
+                    "Perfect for a romantic getaway."
+                ]
+                
+                review = Review(
+                    user_id=user.id,
+                    hotel_id=hotel.id,
+                    rating=rating,
+                    comment=random.choice(comments),
+                    created_at=datetime.now() - timedelta(days=random.randint(1, 365))
+                )
+                db.session.add(review)
+        
+        db.session.commit()
+        
+        print("Sample data created successfully!")
+
+if __name__ == '__main__':
+    create_sample_data()
+EOL
+
+# Create email templates
+mkdir -p templates/emails
+cat > templates/emails/confirm_email.html << 'EOL'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Confirm Your Email</title>
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .logo { font-size: 24px; font-weight: bold; color: #059669; }
+        .button {
+            display: inline-block;
+            padding: 12px 24px;
+            background-color: #059669;
+            color: white;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: bold;
+            margin: 20px 0;
+        }
+        .footer { margin-top: 30px; text-align: center; font-size: 12px; color: #777; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">VamosWay</div>
+            <h2>Confirm Your Email Address</h2>
+        </div>
+        
+        <p>Hello,</p>
+        <p>Thank you for registering with VamosWay. Please confirm your email address by clicking the button below:</p>
+        
+        <div style="text-align: center;">
+            <a href="{{ confirm_url }}" class="button">Confirm Email</a>
+        </div>
+        
+        <p>If you didn't create an account with VamosWay, you can safely ignore this email.</p>
+        
+        <div class="footer">
+            <p>&copy; {{ current_year }} VamosWay. All rights reserved.</p>
+            <p>Marrakech, Morocco</p>
+        </div>
+    </div>
+</body>
+</html>
+EOL
+
+# Create README.md
+cat > README.md << 'EOL'
+# VamosWay - AI-Powered Moroccan Travel Platform
+
+![VamosWay Screenshot](static/images/screenshot.jpg)
+
+VamosWay is a modern travel platform that uses artificial intelligence to create personalized Moroccan travel experiences. The application combines hotel bookings, activity recommendations, and AI-powered itinerary planning with social login and secure payment processing.
+
+## Features
+
+- **AI-Powered Recommendations**: Get personalized travel plans based on your preferences
+- **Hotel & Activity Bookings**: Browse and book hotels and activities across Morocco
+- **Social Login**: Sign in with Google, Apple, or Twitter
+- **Secure Payments**: Integrated Stripe payment processing
+- **Interactive Maps**: Google Maps integration for location visualization
+- **User Reviews**: Read and write reviews for hotels and activities
+- **Responsive Design**: Works on all devices from mobile to desktop
+
+## Technologies Used
+
+- **Backend**: Python, Flask, SQLAlchemy
+- **Frontend**: HTML5, CSS3, JavaScript, Tailwind CSS
+- **Database**: SQLite (can be configured for PostgreSQL/MySQL)
+- **AI**: OpenAI GPT for recommendations
+- **APIs**: Google Maps, Stripe, OAuth providers
+- **Other**: Flask-Login, Authlib, Pillow
+
+## Setup Instructions
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/yourusername/vamosway.git
+   cd vamosway
