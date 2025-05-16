@@ -1,0 +1,1406 @@
+#!/bin/bash
+
+# Create project structure
+mkdir -p vamosway/{static/{css,js,images,fonts},templates/{auth,admin,partials},models,services,utils}
+
+# Create main application files
+cat > vamosway/app.py << 'EOL'
+from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, session
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from datetime import datetime
+import os
+from dotenv import load_dotenv
+import stripe
+from authlib.integrations.flask_client import OAuth
+from flask_wtf.csrf import CSRFProtect
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Flask app
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.getenv('SECRET_KEY'),
+    SQLALCHEMY_DATABASE_URI='sqlite:///vamosway.db',
+    UPLOAD_FOLDER='static/images/uploads',
+    AI_MODEL=os.getenv('AI_MODEL', 'gpt-4'),
+    GOOGLE_MAPS_API_KEY=os.getenv('GOOGLE_MAPS_API_KEY'),
+    STRIPE_PUBLIC_KEY=os.getenv('STRIPE_PUBLIC_KEY'),
+    STRIPE_SECRET_KEY=os.getenv('STRIPE_SECRET_KEY'),
+    OAUTH2_PROVIDERS={
+        'google': {
+            'client_id': os.getenv('GOOGLE_CLIENT_ID'),
+            'client_secret': os.getenv('GOOGLE_CLIENT_SECRET'),
+            'authorize_url': 'https://accounts.google.com/o/oauth2/auth',
+            'token_url': 'https://accounts.google.com/o/oauth2/token',
+            'userinfo': {
+                'url': 'https://www.googleapis.com/oauth2/v3/userinfo',
+                'email': lambda json: json['email'],
+            },
+            'scopes': ['https://www.googleapis.com/auth/userinfo.email'],
+        }
+    }
+)
+
+# Initialize extensions
+csrf = CSRFProtect(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+stripe.api_key = app.config['STRIPE_SECRET_KEY']
+oauth = OAuth(app)
+
+# Import models and services
+from models import db, User, Hotel, Activity, Booking, Review
+from services.booking_service import BookingService
+from services.payment_processor import PaymentProcessor
+from services.map_service import MapService
+from utils.social_login import init_social_login
+from utils.email_service import send_confirmation_email
+
+# Initialize services
+booking_service = BookingService()
+payment_processor = PaymentProcessor()
+map_service = MapService(app.config['GOOGLE_MAPS_API_KEY'])
+
+# Initialize social login
+init_social_login(app, oauth)
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+@app.route('/')
+def home():
+    featured_hotels = Hotel.query.order_by(Hotel.rating.desc()).limit(3).all()
+    popular_activities = Activity.query.order_by(Activity.price).limit(6).all()
+    return render_template('index.html', 
+                         featured_hotels=featured_hotels,
+                         popular_activities=popular_activities)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+        
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        remember = True if request.form.get('remember') else False
+        
+        user = User.query.filter_by(email=email).first()
+        
+        if not user or not check_password_hash(user.password, password):
+            flash('Invalid email or password', 'error')
+            return redirect(url_for('login'))
+            
+        login_user(user, remember=remember)
+        next_page = request.args.get('next')
+        return redirect(next_page or url_for('dashboard'))
+        
+    return render_template('auth/login.html')
+
+@app.route('/login/<provider>')
+def login_provider(provider):
+    if provider not in app.config['OAUTH2_PROVIDERS']:
+        abort(404)
+    redirect_uri = url_for('auth_callback', provider=provider, _external=True)
+    return oauth.create_client(provider).authorize_redirect(redirect_uri)
+
+@app.route('/auth/callback/<provider>')
+def auth_callback(provider):
+    if provider not in app.config['OAUTH2_PROVIDERS']:
+        abort(404)
+        
+    client = oauth.create_client(provider)
+    token = client.authorize_access_token()
+    user_info = client.parse_id_token(token)
+    
+    email = user_info.get('email')
+    if not email:
+        flash('Email not provided by the provider', 'error')
+        return redirect(url_for('login'))
+    
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        user = User(
+            email=email,
+            password=generate_password_hash(os.urandom(24).hex()),
+            is_verified=True
+        )
+        db.session.add(user)
+        db.session.commit()
+    
+    login_user(user)
+    return redirect(url_for('dashboard'))
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+        
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        
+        if User.query.filter_by(email=email).first():
+            flash('Email already exists', 'error')
+            return redirect(url_for('register'))
+            
+        user = User(
+            email=email,
+            password=generate_password_hash(password),
+            is_verified=False
+        )
+        db.session.add(user)
+        db.session.commit()
+        
+        send_confirmation_email(user)
+        flash('Confirmation email sent. Please check your inbox.', 'success')
+        return redirect(url_for('login'))
+        
+    return render_template('auth/register.html')
+
+@app.route('/verify/<token>')
+def verify_email(token):
+    user = User.verify_token(token)
+    if not user:
+        flash('Invalid or expired token', 'error')
+        return redirect(url_for('login'))
+    
+    user.is_verified = True
+    db.session.commit()
+    flash('Email verified successfully', 'success')
+    return redirect(url_for('dashboard'))
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('home'))
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    bookings = Booking.query.filter_by(user_id=current_user.id).order_by(Booking.date.desc()).limit(3).all()
+    return render_template('dashboard.html', bookings=bookings)
+
+@app.route('/hotels')
+def hotels():
+    page = request.args.get('page', 1, type=int)
+    per_page = 9
+    hotels = Hotel.query.paginate(page=page, per_page=per_page)
+    map_locations = [{
+        'lat': hotel.latitude,
+        'lng': hotel.longitude,
+        'name': hotel.name,
+        'id': hotel.id
+    } for hotel in hotels.items if hotel.latitude and hotel.longitude]
+    
+    return render_template('hotels.html', 
+                         hotels=hotels,
+                         map_locations=map_locations,
+                         map_api_key=app.config['GOOGLE_MAPS_API_KEY'])
+
+@app.route('/hotel/<int:id>')
+def hotel_detail(id):
+    hotel = Hotel.query.get_or_404(id)
+    reviews = Review.query.filter_by(hotel_id=id).order_by(Review.created_at.desc()).limit(5).all()
+    similar_hotels = Hotel.query.filter(
+        Hotel.location == hotel.location,
+        Hotel.id != hotel.id
+    ).limit(3).all()
+    
+    return render_template('hotel_detail.html',
+                         hotel=hotel,
+                         reviews=reviews,
+                         similar_hotels=similar_hotels)
+
+@app.route('/book-hotel', methods=['POST'])
+@login_required
+def book_hotel():
+    hotel_id = request.form.get('hotel_id')
+    check_in = request.form.get('check_in')
+    check_out = request.form.get('check_out')
+    guests = request.form.get('guests', 1)
+    
+    try:
+        booking = booking_service.create_hotel_booking(
+            user_id=current_user.id,
+            hotel_id=hotel_id,
+            check_in=datetime.strptime(check_in, '%Y-%m-%d'),
+            check_out=datetime.strptime(check_out, '%Y-%m-%d'),
+            guests=guests
+        )
+        
+        session['booking_id'] = booking.id
+        return redirect(url_for('payment'))
+    except Exception as e:
+        flash(str(e), 'error')
+        return redirect(request.referrer)
+
+@app.route('/payment')
+@login_required
+def payment():
+    booking_id = session.get('booking_id')
+    if not booking_id:
+        return redirect(url_for('dashboard'))
+        
+    booking = Booking.query.get(booking_id)
+    if not booking or booking.user_id != current_user.id:
+        return redirect(url_for('dashboard'))
+        
+    return render_template('payment.html',
+                         booking=booking,
+                         stripe_public_key=app.config['STRIPE_PUBLIC_KEY'])
+
+@app.route('/create-payment-intent', methods=['POST'])
+@login_required
+def create_payment_intent():
+    booking_id = session.get('booking_id')
+    if not booking_id:
+        return jsonify({'error': 'Invalid booking'}), 400
+        
+    booking = Booking.query.get(booking_id)
+    if not booking or booking.user_id != current_user.id:
+        return jsonify({'error': 'Invalid booking'}), 400
+        
+    try:
+        intent = payment_processor.create_intent(
+            amount=int(booking.total_amount * 100),  # in cents
+            currency='mad',
+            metadata={
+                'booking_id': booking.id,
+                'user_id': current_user.id
+            }
+        )
+        return jsonify({'clientSecret': intent.client_secret})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/payment-success')
+@login_required
+def payment_success():
+    booking_id = session.get('booking_id')
+    if not booking_id:
+        return redirect(url_for('dashboard'))
+        
+    booking = Booking.query.get(booking_id)
+    if not booking or booking.user_id != current_user.id:
+        return redirect(url_for('dashboard'))
+        
+    booking.status = 'confirmed'
+    db.session.commit()
+    session.pop('booking_id', None)
+    
+    flash('Payment successful! Your booking is confirmed.', 'success')
+    return redirect(url_for('booking_detail', id=booking.id))
+
+@app.route('/booking/<int:id>')
+@login_required
+def booking_detail(id):
+    booking = Booking.query.get_or_404(id)
+    if booking.user_id != current_user.id:
+        abort(403)
+        
+    return render_template('booking_detail.html', booking=booking)
+
+@app.route('/ai-recommendations', methods=['GET', 'POST'])
+@login_required
+def ai_recommendations():
+    if request.method == 'POST':
+        preferences = request.form.get('preferences')
+        budget = request.form.get('budget')
+        duration = request.form.get('duration')
+        
+        # In a real app, this would call your AI service
+        recommendations = [
+            {'type': 'hotel', 'name': 'Luxury Riad in Marrakech', 'price': 1200, 'rating': 4.8},
+            {'type': 'activity', 'name': 'Atlas Mountains Day Trip', 'price': 450, 'rating': 4.9},
+            {'type': 'hotel', 'name': 'Beach Resort in Agadir', 'price': 1800, 'rating': 4.7}
+        ]
+        return render_template('recommendations.html', recommendations=recommendations)
+    return render_template('ai_recommendations.html')
+
+@app.route('/add-review', methods=['POST'])
+@login_required
+def add_review():
+    hotel_id = request.form.get('hotel_id')
+    rating = request.form.get('rating')
+    comment = request.form.get('comment')
+    
+    if not hotel_id or not rating:
+        flash('Please provide a rating', 'error')
+        return redirect(request.referrer)
+    
+    review = Review(
+        user_id=current_user.id,
+        hotel_id=hotel_id,
+        rating=rating,
+        comment=comment
+    )
+    db.session.add(review)
+    db.session.commit()
+    
+    flash('Review submitted successfully', 'success')
+    return redirect(request.referrer)
+
+@app.context_processor
+def inject_globals():
+    return {
+        'current_year': datetime.now().year,
+        'map_api_key': app.config['GOOGLE_MAPS_API_KEY']
+    }
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
+EOL
+
+# Create models
+cat > vamosway/models/__init__.py << 'EOL'
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_login import UserMixin
+from datetime import datetime
+import jwt
+from time import time
+from app import app
+
+db = SQLAlchemy()
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(100), unique=True, nullable=False)
+    password = db.Column(db.String(200))
+    is_verified = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
+    profile_image = db.Column(db.String(100))
+    bookings = db.relationship('Booking', backref='user', lazy=True)
+    reviews = db.relationship('Review', backref='user', lazy=True)
+
+    def get_reset_token(self, expires_in=3600):
+        return jwt.encode(
+            {'reset_password': self.id, 'exp': time() + expires_in},
+            app.config['SECRET_KEY'], algorithm='HS256'
+        )
+
+    @staticmethod
+    def verify_token(token):
+        try:
+            id = jwt.decode(token, app.config['SECRET_KEY'],
+                            algorithms=['HS256'])['reset_password']
+        except:
+            return None
+        return User.query.get(id)
+
+class Hotel(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    location = db.Column(db.String(100), nullable=False)
+    address = db.Column(db.String(200))
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    price = db.Column(db.Float, nullable=False)
+    rating = db.Column(db.Float, default=0.0)
+    amenities = db.Column(db.Text)
+    description = db.Column(db.Text)
+    main_image = db.Column(db.String(100))
+    bookings = db.relationship('Booking', backref='hotel', lazy=True)
+    reviews = db.relationship('Review', backref='hotel', lazy=True)
+
+class Activity(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    location = db.Column(db.String(100), nullable=False)
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    price = db.Column(db.Float, nullable=False)
+    duration = db.Column(db.String(50))
+    difficulty = db.Column(db.String(20))
+    description = db.Column(db.Text)
+    main_image = db.Column(db.String(100))
+    bookings = db.relationship('Booking', backref='activity', lazy=True)
+
+class Booking(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    hotel_id = db.Column(db.Integer, db.ForeignKey('hotel.id'))
+    activity_id = db.Column(db.Integer, db.ForeignKey('activity.id'))
+    date = db.Column(db.DateTime, default=datetime.utcnow)
+    check_in = db.Column(db.Date)
+    check_out = db.Column(db.Date)
+    guests = db.Column(db.Integer, default=1)
+    total_amount = db.Column(db.Float)
+    status = db.Column(db.String(20), default='pending')  # pending, confirmed, cancelled, completed
+    payment_intent = db.Column(db.String(100))
+    special_requests = db.Column(db.Text)
+
+class Review(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    hotel_id = db.Column(db.Integer, db.ForeignKey('hotel.id'), nullable=False)
+    rating = db.Column(db.Integer, nullable=False)
+    comment = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+EOL
+
+# Create services
+mkdir -p vamosway/services
+cat > vamosway/services/booking_service.py << 'EOL'
+from models import db, Booking
+from datetime import datetime
+from sqlalchemy.exc import SQLAlchemyError
+
+class BookingService:
+    def create_hotel_booking(self, user_id, hotel_id, check_in, check_out, guests=1):
+        try:
+            # Check for availability (simplified - in real app would have availability table)
+            existing_bookings = Booking.query.filter(
+                Booking.hotel_id == hotel_id,
+                Booking.check_out >= check_in,
+                Booking.check_in <= check_out,
+                Booking.status == 'confirmed'
+            ).count()
+            
+            if existing_bookings >= 10:  # Assuming max 10 rooms per hotel for demo
+                raise Exception('No available rooms for selected dates')
+            
+            # Calculate total amount (simplified)
+            nights = (check_out - check_in).days
+            total_amount = nights * 1000  # Fixed price for demo
+            
+            booking = Booking(
+                user_id=user_id,
+                hotel_id=hotel_id,
+                check_in=check_in,
+                check_out=check_out,
+                guests=guests,
+                total_amount=total_amount,
+                status='pending'
+            )
+            
+            db.session.add(booking)
+            db.session.commit()
+            return booking
+            
+        except SQLAlchemyError as e:
+            db.session.rollback()
+            raise Exception('Database error occurred')
+        except Exception as e:
+            raise e
+EOL
+
+cat > vamosway/services/payment_processor.py << 'EOL'
+import stripe
+from app import app
+
+class PaymentProcessor:
+    def __init__(self):
+        stripe.api_key = app.config['STRIPE_SECRET_KEY']
+    
+    def create_intent(self, amount, currency, metadata=None):
+        try:
+            intent = stripe.PaymentIntent.create(
+                amount=amount,
+                currency=currency,
+                metadata=metadata or {},
+                automatic_payment_methods={
+                    'enabled': True,
+                },
+            )
+            return intent
+        except stripe.error.StripeError as e:
+            raise Exception(f'Stripe error: {str(e)}')
+EOL
+
+cat > vamosway/services/map_service.py << 'EOL'
+import googlemaps
+from datetime import datetime
+
+class MapService:
+    def __init__(self, api_key):
+        self.gmaps = googlemaps.Client(key=api_key)
+    
+    def geocode(self, address):
+        try:
+            geocode_result = self.gmaps.geocode(address)
+            if geocode_result:
+                location = geocode_result[0]['geometry']['location']
+                return location['lat'], location['lng']
+            return None, None
+        except Exception:
+            return None, None
+    
+    def get_place_details(self, place_id):
+        try:
+            return self.gmaps.place(place_id)
+        except Exception:
+            return None
+    
+    def get_directions(self, origin, destination, mode='driving'):
+        try:
+            now = datetime.now()
+            directions = self.gmaps.directions(
+                origin,
+                destination,
+                mode=mode,
+                departure_time=now
+            )
+            return directions[0] if directions else None
+        except Exception:
+            return None
+EOL
+
+# Create utils
+mkdir -p vamosway/utils
+cat > vamosway/utils/social_login.py << 'EOL'
+from flask import redirect, url_for, flash
+from authlib.integrations.flask_client import OAuth
+from models import db, User
+from werkzeug.security import generate_password_hash
+
+def init_social_login(app, oauth):
+    # Google OAuth
+    oauth.register(
+        name='google',
+        client_id=app.config['OAUTH2_PROVIDERS']['google']['client_id'],
+        client_secret=app.config['OAUTH2_PROVIDERS']['google']['client_secret'],
+        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+        client_kwargs={
+            'scope': 'openid email profile'
+        }
+    )
+EOL
+
+cat > vamosway/utils/email_service.py << 'EOL'
+from flask import url_for, render_template
+from app import app
+from models import User
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import os
+
+def send_confirmation_email(user):
+    token = user.get_reset_token()
+    confirm_url = url_for('verify_email', token=token, _external=True)
+    
+    subject = "Confirm Your VamosWay Account"
+    body = render_template('emails/confirm_email.html', confirm_url=confirm_url)
+    
+    msg = MIMEMultipart()
+    msg['From'] = app.config.get('MAIL_DEFAULT_SENDER', 'noreply@vamosway.com')
+    msg['To'] = user.email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'html'))
+    
+    try:
+        # In production, use a real email service
+        with smtplib.SMTP('localhost') as server:
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        return False
+EOL
+
+# Create templates
+mkdir -p vamosway/templates/{auth,emails,partials}
+
+# Base template
+cat > vamosway/templates/base.html << 'EOL'
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VamosWay - {% block title %}{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+    <script src="https://maps.googleapis.com/maps/api/js?key={{ map_api_key }}&libraries=places&callback=initMap" async defer></script>
+    {% block head %}{% endblock %}
+</head>
+<body class="font-poppins bg-gray-50 text-gray-800">
+    <!-- Navigation -->
+    <nav class="bg-white shadow-lg sticky top-0 z-50">
+        <div class="container mx-auto px-4">
+            <div class="flex justify-between items-center py-4">
+                <a href="{{ url_for('home') }}" class="flex items-center space-x-2">
+                    <span class="text-2xl font-playfair font-bold text-green-700">VamosWay</span>
+                </a>
+                
+                <div class="hidden md:flex items-center space-x-8">
+                    <a href="{{ url_for('home') }}" class="nav-link">Home</a>
+                    <a href="{{ url_for('hotels') }}" class="nav-link">Hotels</a>
+                    <a href="{{ url_for('ai_recommendations') }}" class="nav-link">AI Planner</a>
+                    <a href="#about" class="nav-link">About</a>
+                    <a href="#contact" class="nav-link">Contact</a>
+                </div>
+                
+                <div class="flex items-center space-x-4">
+                    {% if current_user.is_authenticated %}
+                        <a href="{{ url_for('dashboard') }}" class="flex items-center space-x-2">
+                            {% if current_user.profile_image %}
+                                <img src="{{ url_for('static', filename='images/uploads/' + current_user.profile_image) }}" 
+                                     alt="Profile" class="w-8 h-8 rounded-full object-cover">
+                            {% else %}
+                                <div class="w-8 h-8 rounded-full bg-green-600 flex items-center justify-center text-white">
+                                    {{ current_user.email[0].upper() }}
+                                </div>
+                            {% endif %}
+                        </a>
+                        <a href="{{ url_for('logout') }}" class="text-gray-600 hover:text-green-700">
+                            <i class="fas fa-sign-out-alt"></i>
+                        </a>
+                    {% else %}
+                        <a href="{{ url_for('login') }}" class="text-gray-600 hover:text-green-700 px-3 py-1">
+                            Login
+                        </a>
+                        <a href="{{ url_for('register') }}" 
+                           class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg transition duration-300">
+                            Sign Up
+                        </a>
+                    {% endif %}
+                    <button class="md:hidden text-gray-600 focus:outline-none" id="mobile-menu-button">
+                        <i class="fas fa-bars text-xl"></i>
+                    </button>
+                </div>
+            </div>
+            
+            <!-- Mobile menu -->
+            <div class="md:hidden hidden pb-4" id="mobile-menu">
+                <a href="{{ url_for('home') }}" class="block py-2 px-4 hover:bg-gray-100">Home</a>
+                <a href="{{ url_for('hotels') }}" class="block py-2 px-4 hover:bg-gray-100">Hotels</a>
+                <a href="{{ url_for('ai_recommendations') }}" class="block py-2 px-4 hover:bg-gray-100">AI Planner</a>
+                <a href="#about" class="block py-2 px-4 hover:bg-gray-100">About</a>
+                <a href="#contact" class="block py-2 px-4 hover:bg-gray-100">Contact</a>
+                <div class="border-t mt-2 pt-2">
+                    {% if current_user.is_authenticated %}
+                        <a href="{{ url_for('dashboard') }}" class="block py-2 px-4 hover:bg-gray-100">Dashboard</a>
+                    {% else %}
+                        <a href="{{ url_for('login') }}" class="block py-2 px-4 hover:bg-gray-100">Login</a>
+                        <a href="{{ url_for('register') }}" class="block py-2 px-4 hover:bg-gray-100">Register</a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main content -->
+    <main>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="container mx-auto px-4 mt-4">
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }} p-4 mb-4 rounded-lg">
+                            {{ message }}
+                        </div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-gray-900 text-white py-12">
+        <div class="container mx-auto px-4">
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-8">
+                <div>
+                    <h3 class="text-xl font-playfair font-bold mb-4 text-green-400">VamosWay</h3>
+                    <p class="mb-4">Your personalized Moroccan travel experience powered by AI.</p>
+                    <div class="flex space-x-4">
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-facebook-f"></i></a>
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-twitter"></i></a>
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-instagram"></i></a>
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-linkedin-in"></i></a>
+                    </div>
+                </div>
+                
+                <div>
+                    <h4 class="text-lg font-semibold mb-4">Quick Links</h4>
+                    <ul class="space-y-2">
+                        <li><a href="{{ url_for('home') }}" class="hover:text-green-400">Home</a></li>
+                        <li><a href="{{ url_for('hotels') }}" class="hover:text-green-400">Hotels</a></li>
+                        <li><a href="{{ url_for('ai_recommendations') }}" class="hover:text-green-400">AI Planner</a></li>
+                        <li><a href="#about" class="hover:text-green-400">About Us</a></li>
+                        <li><a href="#contact" class="hover:text-green-400">Contact</a></li>
+                    </ul>
+                </div>
+                
+                <div>
+                    <h4 class="text-lg font-semibold mb-4">Support</h4>
+                    <ul class="space-y-2">
+                        <li><a href="#" class="hover:text-green-400">FAQs</a></li>
+                        <li><a href="#" class="hover:text-green-400">Privacy Policy</a></li>
+                        <li><a href="#" class="hover:text-green-400">Terms of Service</a></li>
+                        <li><a href="#" class="hover:text-green-400">Booking Conditions</a></li>
+                    </ul>
+                </div>
+                
+                <div>
+                    <h4 class="text-lg font-semibold mb-4">Contact Us</h4>
+                    <address class="not-italic">
+                        <p class="mb-2"><i class="fas fa-map-marker-alt mr-2 text-green-400"></i> Marrakech, Morocco</p>
+                        <p class="mb-2"><i class="fas fa-phone-alt mr-2 text-green-400"></i> +212 6 12 34 56 78</p>
+                        <p class="mb-2"><i class="fas fa-envelope mr-2 text-green-400"></i> contact@vamosway.com</p>
+                    </address>
+                </div>
+            </div>
+            
+            <div class="border-t border-gray-800 mt-8 pt-8 text-center text-gray-400">
+                <p>&copy; {{ current_year }} VamosWay. All rights reserved.</p>
+            </div>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+EOL
+
+# Index template
+cat > vamosway/templates/index.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Discover Morocco with AI{% endblock %}
+
+{% block head %}
+<style>
+    .hero {
+        background: linear-gradient(rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0.6)), 
+                    url('{{ url_for("static", filename="images/morocco-hero.jpg") }}');
+        background-size: cover;
+        background-position: center;
+    }
+    
+    .search-card {
+        backdrop-filter: blur(10px);
+        background: rgba(255, 255, 255, 0.85);
+    }
+    
+    .feature-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<!-- Hero Section -->
+<section class="hero h-screen flex items-center justify-center text-white relative">
+    <div class="container mx-auto px-4 text-center">
+        <h1 class="text-4xl md:text-6xl font-playfair font-bold mb-6 animate-fadeIn">
+            Discover the Magic of Morocco
+        </h1>
+        <p class="text-xl md:text-2xl mb-8 max-w-2xl mx-auto animate-fadeIn delay-100">
+            AI-powered personalized travel experiences in the heart of North Africa
+        </p>
+        <div class="flex flex-col md:flex-row justify-center space-y-4 md:space-y-0 md:space-x-6 animate-fadeIn delay-200">
+            <a href="{{ url_for('ai_recommendations') }}" 
+               class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-8 rounded-lg text-lg transition duration-300">
+                Plan Your Trip
+            </a>
+            <a href="{{ url_for('hotels') }}" 
+               class="bg-transparent hover:bg-white hover:text-gray-900 text-white font-bold py-3 px-8 border-2 border-white rounded-lg text-lg transition duration-300">
+                Browse Hotels
+            </a>
+        </div>
+    </div>
+    
+    <div class="absolute bottom-10 left-0 right-0 text-center animate-bounce">
+        <a href="#explore" class="text-white text-2xl">
+            <i class="fas fa-chevron-down"></i>
+        </a>
+    </div>
+</section>
+
+<!-- Features Section -->
+<section class="py-16 bg-white">
+    <div class="container mx-auto px-4">
+        <div class="text-center mb-12">
+            <h2 class="text-3xl font-playfair font-bold mb-4">Why Choose VamosWay?</h2>
+            <p class="text-gray-600 max-w-2xl mx-auto">
+                We combine local expertise with AI technology to create your perfect Moroccan adventure
+            </p>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <div class="feature-card bg-white p-8 rounded-xl shadow-md border border-gray-100 transition duration-300">
+                <div class="text-green-600 text-4xl mb-4">
+                    <i class="fas fa-robot"></i>
+                </div>
+                <h3 class="text-xl font-bold mb-3">AI-Powered Planning</h3>
+                <p class="text-gray-600">
+                    Our intelligent system learns your preferences to craft a personalized itinerary that matches your travel style.
+                </p>
+            </div>
+            
+            <div class="feature-card bg-white p-8 rounded-xl shadow-md border border-gray-100 transition duration-300">
+                <div class="text-green-600 text-4xl mb-4">
+                    <i class="fas fa-map-marked-alt"></i>
+                </div>
+                <h3 class="text-xl font-bold mb-3">Local Expertise</h3>
+                <p class="text-gray-600">
+                    Discover hidden gems and authentic experiences curated by our network of local Moroccan experts.
+                </p>
+            </div>
+            
+            <div class="feature-card bg-white p-8 rounded-xl shadow-md border border-gray-100 transition duration-300">
+                <div class="text-green-600 text-4xl mb-4">
+                    <i class="fas fa-hand-holding-heart"></i>
+                </div>
+                <h3 class="text-xl font-bold mb-3">Hassle-Free Booking</h3>
+                <p class="text-gray-600">
+                    One platform for all your travel needs - hotels, activities, and transportation with instant confirmation.
+                </p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Featured Hotels Section -->
+<section class="py-16 bg-gray-100">
+    <div class="container mx-auto px-4">
+        <div class="flex justify-between items-center mb-8">
+            <h2 class="text-3xl font-playfair font-bold">Featured Hotels & Riads</h2>
+            <a href="{{ url_for('hotels') }}" class="text-green-700 hover:text-green-800 font-semibold">
+                View All <i class="fas fa-arrow-right ml-1"></i>
+            </a>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {% for hotel in featured_hotels %}
+            <div class="bg-white rounded-xl overflow-hidden shadow-lg hover:shadow-xl transition duration-300">
+                <div class="relative h-64 overflow-hidden">
+                    <img src="{{ url_for('static', filename='images/hotels/' + hotel.main_image) if hotel.main_image else url_for('static', filename='images/default-hotel.jpg') }}" 
+                         alt="{{ hotel.name }}" class="w-full h-full object-cover transition duration-500 hover:scale-105">
+                    <div class="absolute top-4 right-4 bg-white px-3 py-1 rounded-full shadow-md">
+                        <span class="text-green-700 font-bold">{{ hotel.rating }} <i class="fas fa-star text-yellow-400"></i></span>
+                    </div>
+                </div>
+                <div class="p-6">
+                    <div class="flex justify-between items-start mb-2">
+                        <h3 class="text-xl font-bold">{{ hotel.name }}</h3>
+                        <span class="text-gray-600">
+                            <i class="fas fa-map-marker-alt text-green-600 mr-1"></i> {{ hotel.location }}
+                        </span>
+                    </div>
+                    <p class="text-gray-600 mb-4">{{ hotel.description|truncate(120) }}</p>
+                    <div class="flex justify-between items-center">
+                        <span class="text-xl font-bold text-green-700">{{ hotel.price }} MAD <span class="text-sm font-normal text-gray-500">/ night</span></span>
+                        <a href="{{ url_for('hotel_detail', id=hotel.id) }}" 
+                           class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg transition duration-300">
+                            View
+                        </a>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</section>
+
+<!-- AI Recommendation CTA -->
+<section class="py-16 bg-gradient-to-r from-green-800 to-blue-800 text-white">
+    <div class="container mx-auto px-4 text-center">
+        <h2 class="text-3xl font-playfair font-bold mb-6">Let AI Plan Your Perfect Trip</h2>
+        <p class="text-xl mb-8 max-w-2xl mx-auto">
+            Our intelligent system creates a personalized itinerary based on your preferences, budget, and travel style.
+        </p>
+        <a href="{{ url_for('ai_recommendations') }}" 
+           class="inline-block bg-white hover:bg-gray-100 text-green-800 font-bold py-3 px-8 rounded-lg text-lg transition duration-300">
+            Try Our AI Planner
+        </a>
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Mobile menu toggle
+    document.getElementById('mobile-menu-button').addEventListener('click', function() {
+        const menu = document.getElementById('mobile-menu');
+        menu.classList.toggle('hidden');
+    });
+    
+    // Smooth scrolling for anchor links
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener('click', function(e) {
+            e.preventDefault();
+            const target = document.querySelector(this.getAttribute('href'));
+            if (target) {
+                window.scrollTo({
+                    top: target.offsetTop - 80,
+                    behavior: 'smooth'
+                });
+            }
+        });
+    });
+</script>
+{% endblock %}
+EOL
+
+# Create other templates (login, register, dashboard, etc.)
+cat > vamosway/templates/auth/login.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Login - VamosWay{% endblock %}
+
+{% block content %}
+<div class="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
+    <div class="max-w-md w-full space-y-8">
+        <div>
+            <h2 class="mt-6 text-center text-3xl font-playfair font-bold text-gray-900">
+                Sign in to your account
+            </h2>
+            <p class="mt-2 text-center text-sm text-gray-600">
+                Or <a href="{{ url_for('register') }}" class="font-medium text-green-600 hover:text-green-500">create a new account</a>
+            </p>
+        </div>
+        <form class="mt-8 space-y-6" method="POST" action="{{ url_for('login') }}">
+            <div class="rounded-md shadow-sm space-y-4">
+                <div>
+                    <label for="email" class="block text-sm font-medium text-gray-700">Email address</label>
+                    <input id="email" name="email" type="email" autocomplete="email" required
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-green-500 focus:border-green-500">
+                </div>
+                <div>
+                    <label for="password" class="block text-sm font-medium text-gray-700">Password</label>
+                    <input id="password" name="password" type="password" autocomplete="current-password" required
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-green-500 focus:border-green-500">
+                </div>
+            </div>
+
+            <div class="flex items-center justify-between">
+                <div class="flex items-center">
+                    <input id="remember" name="remember" type="checkbox"
+                           class="h-4 w-4 text-green-600 focus:ring-green-500 border-gray-300 rounded">
+                    <label for="remember" class="ml-2 block text-sm text-gray-900">Remember me</label>
+                </div>
+
+                <div class="text-sm">
+                    <a href="#" class="font-medium text-green-600 hover:text-green-500">Forgot your password?</a>
+                </div>
+            </div>
+
+            <div>
+                <button type="submit"
+                        class="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500">
+                    Sign in
+                </button>
+            </div>
+        </form>
+        
+        <div class="mt-6">
+            <div class="relative">
+                <div class="absolute inset-0 flex items-center">
+                    <div class="w-full border-t border-gray-300"></div>
+                </div>
+                <div class="relative flex justify-center text-sm">
+                    <span class="px-2 bg-gray-50 text-gray-500">Or continue with</span>
+                </div>
+            </div>
+
+            <div class="mt-6 grid grid-cols-1 gap-3">
+                <a href="{{ url_for('login_provider', provider='google') }}"
+                   class="w-full inline-flex justify-center py-2 px-4 border border-gray-300 rounded-md shadow-sm bg-white text-sm font-medium text-gray-500 hover:bg-gray-50">
+                    <i class="fab fa-google mr-2"></i> Google
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+EOL
+
+cat > vamosway/templates/auth/register.html << 'EOL'
+{% extends "base.html" %}
+
+{% block title %}Register - VamosWay{% endblock %}
+
+{% block content %}
+<div class="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
+    <div class="max-w-md w-full space-y-8">
+        <div>
+            <h2 class="mt-6 text-center text-3xl font-playfair font-bold text-gray-900">
+                Create a new account
+            </h2>
+            <p class="mt-2 text-center text-sm text-gray-600">
+                Or <a href="{{ url_for('login') }}" class="font-medium text-green-600 hover:text-green-500">sign in to your existing account</a>
+            </p>
+        </div>
+        <form class="mt-8 space-y-6" method="POST" action="{{ url_for('register') }}">
+            <div class="rounded-md shadow-sm space-y-4">
+                <div>
+                    <label for="email" class="block text-sm font-medium text-gray-700">Email address</label>
+                    <input id="email" name="email" type="email" autocomplete="email" required
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-green-500 focus:border-green-500">
+                </div>
+                <div>
+                    <label for="password" class="block text-sm font-medium text-gray-700">Password</label>
+                    <input id="password" name="password" type="password" autocomplete="new-password" required
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-green-500 focus:border-green-500">
+                </div>
+            </div>
+
+            <div class="flex items-center">
+                <input id="terms" name="terms" type="checkbox" required
+                       class="h-4 w-4 text-green-600 focus:ring-green-500 border-gray-300 rounded">
+                <label for="terms" class="ml-2 block text-sm text-gray-900">
+                    I agree to the <a href="#" class="text-green-600 hover:text-green-500">Terms of Service</a> and <a href="#" class="text-green-600 hover:text-green-500">Privacy Policy</a>
+                </label>
+            </div>
+
+            <div>
+                <button type="submit"
+                        class="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500">
+                    Register
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+EOL
+
+# Create static files
+mkdir -p vamosway/static/{css,js}
+
+cat > vamosway/static/css/main.css << 'EOL'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom styles */
+body {
+    font-family: 'Poppins', sans-serif;
+}
+
+.font-playfair {
+    font-family: 'Playfair Display', serif;
+}
+
+.nav-link {
+    @apply text-gray-700 hover:text-green-600 transition duration-300;
+}
+
+.alert {
+    @apply p-4 rounded-lg mb-4;
+}
+
+.alert-success {
+    @apply bg-green-100 text-green-800 border border-green-200;
+}
+
+.alert-error {
+    @apply bg-red-100 text-red-800 border border-red-200;
+}
+
+/* Animations */
+.animate-fadeIn {
+    animation: fadeIn 0.8s ease-out;
+}
+
+.animate-fadeIn.delay-100 {
+    animation-delay: 0.1s;
+}
+
+.animate-fadeIn.delay-200 {
+    animation-delay: 0.2s;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-bounce {
+    animation: bounce 2s infinite;
+}
+
+@keyframes bounce {
+    0%, 20%, 50%, 80%, 100% { transform: translateY(0); }
+    40% { transform: translateY(-20px); }
+    60% { transform: translateY(-10px); }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #059669;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #047857;
+}
+EOL
+
+cat > vamosway/static/js/main.js << 'EOL'
+document.addEventListener('DOMContentLoaded', function() {
+    // Mobile menu toggle
+    const mobileMenuButton = document.getElementById('mobile-menu-button');
+    const mobileMenu = document.getElementById('mobile-menu');
+    
+    if (mobileMenuButton && mobileMenu) {
+        mobileMenuButton.addEventListener('click', function() {
+            mobileMenu.classList.toggle('hidden');
+        });
+    }
+    
+    // Form validation
+    const forms = document.querySelectorAll('form');
+    forms.forEach(form => {
+        form.addEventListener('submit', function(e) {
+            let isValid = true;
+            const requiredInputs = form.querySelectorAll('input[required], select[required], textarea[required]');
+            
+            requiredInputs.forEach(input => {
+                if (!input.value.trim()) {
+                    input.classList.add('border-red-500');
+                    isValid = false;
+                } else {
+                    input.classList.remove('border-red-500');
+                }
+            });
+            
+            if (!isValid) {
+                e.preventDefault();
+                alert('Please fill in all required fields');
+            }
+        });
+    });
+    
+    // Smooth scrolling for anchor links
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener('click', function(e) {
+            e.preventDefault();
+            const target = document.querySelector(this.getAttribute('href'));
+            if (target) {
+                window.scrollTo({
+                    top: target.offsetTop - 80,
+                    behavior: 'smooth'
+                });
+            }
+        });
+    });
+});
+EOL
+
+# Create requirements.txt
+cat > requirements.txt << 'EOL'
+flask==3.0.0
+flask-login==0.6.3
+flask-sqlalchemy==3.1.1
+flask-oauthlib==0.9.6
+authlib==1.2.1
+openai==1.3.6
+pillow==10.0.1
+python-dotenv==1.0.0
+requests==2.31.0
+googlemaps==4.10.0
+stripe==7.0.0
+geopy==2.4.0
+email-validator==2.0.0
+flask-wtf==1.2.1
+EOL
+
+# Create .env file
+cat > .env << 'EOL'
+SECRET_KEY=your-secret-key-here
+OPENAI_API_KEY=your-openai-api-key
+GOOGLE_MAPS_API_KEY=your-google-maps-api-key
+STRIPE_PUBLIC_KEY=your-stripe-public-key
+STRIPE_SECRET_KEY=your-stripe-secret-key
+GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+EOL
+
+# Create sample data script
+cat > create_sample_data.py << 'EOL'
+from app import app, db
+from models import User, Hotel, Activity, Review
+from datetime import datetime, timedelta
+import random
+
+def create_sample_data():
+    with app.app_context():
+        # Clear existing data
+        db.drop_all()
+        db.create_all()
+        
+        # Create sample users
+        users = [
+            User(email='user1@example.com', password='password1', is_verified=True),
+            User(email='user2@example.com', password='password2', is_verified=True),
+            User(email='user3@example.com', password='password3', is_verified=True),
+        ]
+        db.session.add_all(users)
+        db.session.commit()
+        
+        # Create sample hotels
+        moroccan_cities = ['Marrakech', 'Fes', 'Casablanca', 'Tangier', 'Chefchaouen', 'Essaouira', 'Rabat', 'Agadir']
+        hotel_descriptions = [
+            "A luxurious riad in the heart of the medina with traditional Moroccan architecture and modern amenities.",
+            "Beautiful boutique hotel with a rooftop terrace offering stunning views of the city.",
+            "Eco-friendly resort with spacious rooms, swimming pool, and spa facilities.",
+            "Historic palace converted into a 5-star hotel with exquisite decor and gourmet restaurant.",
+            "Charming guesthouse with authentic Moroccan hospitality and home-cooked meals.",
+        ]
+        
+        hotels = []
+        for i in range(15):
+            city = random.choice(moroccan_cities)
+            price = random.randint(500, 3000)
+            rating = round(random.uniform(3.5, 5.0), 1)
+            
+            hotel = Hotel(
+                name=f"{random.choice(['Riad', 'Hotel', 'Resort', 'Palace'])} {random.choice(['Al Andalus', 'Atlas', 'Sahara', 'Oasis', 'Mogador', 'Zamzam'])}",
+                location=city,
+                address=f"{random.randint(1, 200)} {random.choice(['Rue', 'Avenue'])} {random.choice(['Mohammed V', 'Hassan II', 'Ibn Battuta', 'Al Qods'])}",
+                latitude=31.63 + random.uniform(-0.5, 0.5),
+                longitude=-8.00 + random.uniform(-0.5, 0.5),
+                price=price,
+                rating=rating,
+                amenities=", ".join(random.sample(['Pool', 'Spa', 'Restaurant', 'Gym', 'WiFi', 'Parking', 'Air Conditioning', 'Breakfast'], 5)),
+                description=random.choice(hotel_descriptions),
+                main_image=f"hotel-{i+1}.jpg" if i < 10 else None
+            )
+            hotels.append(hotel)
+        
+        db.session.add_all(hotels)
+        db.session.commit()
+        
+        # Create sample activities
+        activity_names = [
+            "Sahara Desert Camp Experience",
+            "Atlas Mountains Trekking Tour",
+            "Marrakech Food Tasting Walk",
+            "Fes Medina Guided Tour",
+            "Chefchaouen Photography Workshop",
+            "Traditional Moroccan Cooking Class",
+            "Hammam & Spa Day Experience",
+            "Hot Air Balloon Ride at Sunrise",
+            "Surfing Lessons in Taghazout",
+            "Historical Rabat Walking Tour"
+        ]
+        
+        activities = []
+        for i, name in enumerate(activity_names):
+            city = random.choice(moroccan_cities)
+            price = random.randint(200, 1500)
+            duration = f"{random.randint(2, 8)} hours"
+            
+            activity = Activity(
+                name=name,
+                location=city,
+                latitude=31.63 + random.uniform(-0.5, 0.5),
+                longitude=-8.00 + random.uniform(-0.5, 0.5),
+                price=price,
+                duration=duration,
+                difficulty=random.choice(['Easy', 'Moderate', 'Challenging']),
+                description=f"Experience the best of {city} with this {name.lower()}. Our expert guides will ensure you have an unforgettable time.",
+                main_image=f"activity-{i+1}.jpg" if i < 8 else None
+            )
+            activities.append(activity)
+        
+        db.session.add_all(activities)
+        db.session.commit()
+        
+        # Create sample reviews
+        for hotel in hotels:
+            for i in range(random.randint(3, 8)):
+                user = random.choice(users)
+                rating = random.randint(3, 5)
+                comments = [
+                    "Great experience, would definitely recommend!",
+                    "Beautiful property with excellent service.",
+                    "The location was perfect for exploring the city.",
+                    "Some issues with cleanliness but overall good stay.",
+                    "Absolutely stunning riad with amazing staff.",
+                    "The breakfast was delicious every morning.",
+                    "A bit noisy at night but comfortable rooms.",
+                    "Perfect for a romantic getaway."
+                ]
+                
+                review = Review(
+                    user_id=user.id,
+                    hotel_id=hotel.id,
+                    rating=rating,
+                    comment=random.choice(comments),
+                    created_at=datetime.now() - timedelta(days=random.randint(1, 365))
+                )
+                db.session.add(review)
+        
+        db.session.commit()
+        
+        print("Sample data created successfully!")
+
+if __name__ == '__main__':
+    create_sample_data()
+EOL
+
+# Create README.md
+cat > README.md << 'EOL'
+# VamosWay - AI-Powered Moroccan Travel Platform
+
+VamosWay is a modern travel platform that uses artificial intelligence to create personalized Moroccan travel experiences.
+
+## Features
+
+- AI-Powered Recommendations
+- Hotel & Activity Bookings
+- Social Login (Google)
+- Secure Payments (Stripe)
+- Interactive Maps (Google Maps)
+- User Reviews
+- Responsive Design
+
+## Setup
+
+1. Clone the repository
+2. Create and activate virtual environment
+3. Install dependencies: `pip install -r requirements.txt`
+4. Set up environment variables in `.env` file
+5. Create sample data: `python create_sample_data.py`
+6. Run the app: `python app.py`
+
+## Configuration
+
+You'll need API keys for:
+- Google Maps
+- Stripe
+- Google OAuth
+- OpenAI (optional)
+
+## License
+
+MIT
+EOL
+
+echo "VamosWay application created successfully!"
+echo "To get started:"
+echo "1. cd vamosway"
+echo "2. python -m venv venv"
+echo "3. source venv/bin/activate (or venv\Scripts\activate on Windows)"
+echo "4. pip install -r requirements.txt"
+echo "5. python create_sample_data.py"
+echo "6. python app.py"
